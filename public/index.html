@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Fenn — Plaid sandbox test</title>
+  <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 600px; margin: 60px auto; padding: 0 20px; }
+    button { font-size: 15px; padding: 10px 16px; margin: 6px 6px 6px 0; cursor: pointer; }
+    pre { background: #f4f4f4; padding: 12px; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; }
+    #status { color: #666; margin: 10px 0; }
+  </style>
+</head>
+<body>
+  <h2>Fenn — Plaid sandbox test harness</h2>
+  <p>This is a throwaway test page, not part of the real app. It exists to prove Plaid Link → access token → transaction sync works end to end.</p>
+
+  <button id="connect-btn">Connect a bank (sandbox)</button>
+  <button id="sync-btn">Sync transactions</button>
+  <button id="view-btn">View synced transactions</button>
+  <div id="status"></div>
+  <pre id="output"></pre>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const outputEl = document.getElementById('output');
+
+    async function createLinkToken() {
+      const res = await fetch('/api/create_link_token', { method: 'POST' });
+      const data = await res.json();
+      return data.link_token;
+    }
+
+    document.getElementById('connect-btn').addEventListener('click', async () => {
+      statusEl.textContent = 'Creating link token...';
+      const linkToken = await createLinkToken();
+
+      const handler = Plaid.create({
+        token: linkToken,
+        onSuccess: async (public_token, metadata) => {
+          statusEl.textContent = 'Exchanging public token...';
+          const res = await fetch('/api/exchange_public_token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ public_token, institution_name: metadata.institution && metadata.institution.name }),
+          });
+          const data = await res.json();
+          statusEl.textContent = 'Bank connected. Item ID: ' + data.item_id;
+        },
+        onExit: (err, metadata) => {
+          if (err) statusEl.textContent = 'Link exited with error: ' + err.error_message;
+        },
+      });
+      handler.open();
+    });
+
+    document.getElementById('sync-btn').addEventListener('click', async () => {
+      statusEl.textContent = 'Syncing transactions...';
+      const res = await fetch('/api/sync_transactions', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) {
+        statusEl.textContent = 'Error: ' + data.error;
+        return;
+      }
+      statusEl.textContent = `Synced. Added: ${data.added}, Modified: ${data.modified}, Removed: ${data.removed}`;
+      outputEl.textContent = JSON.stringify(data, null, 2);
+    });
+
+    document.getElementById('view-btn').addEventListener('click', async () => {
+      statusEl.textContent = 'Loading transactions from database...';
+      const res = await fetch('/api/transactions');
+      const data = await res.json();
+      statusEl.textContent = `${data.length} transactions in database.`;
+      outputEl.textContent = JSON.stringify(data, null, 2);
+    });
+  </script>
+</body>
+</html>

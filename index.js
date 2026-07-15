@@ -1,0 +1,712 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const plaidClient = require('./plaidClient');
+const pool = require('./db');
+const { register, login, loginWithApple, logout, requireAuth } = require('./auth');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.static('public'));
+app.use((req, res, next) => {
+  console.log(`[request] ${req.method} ${req.originalUrl}`);
+  next();
+});
+
+// node-postgres parses DATE columns into JS Date objects using the *local* timezone of
+// this process, not UTC. Reading the date back out with local getters (not toISOString,
+// which is UTC) correctly reverses that regardless of what timezone this server runs in.
+function toDateOnly(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password, marketing_consent, tos_accepted } = req.body;
+    if (!email || !EMAIL_RE.test(email)) {
+      return res.status(400).json({ error: 'A valid email is required.' });
+    }
+    if (!password || password.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+    }
+    if (!tos_accepted) {
+      return res.status(400).json({ error: 'You must accept the Terms of Service and Privacy Policy.' });
+    }
+    const { token, user } = await register({ email, password, marketingConsent: marketing_consent });
+    res.json({ token, user });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to register' });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required.' });
+    }
+    const { token, user } = await login({ email, password });
+    res.json({ token, user });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to log in' });
+  }
+});
+
+app.post('/api/auth/apple', async (req, res) => {
+  try {
+    const { identity_token, email, marketing_consent, tos_accepted } = req.body;
+    if (!identity_token) {
+      return res.status(400).json({ error: 'identity_token is required.' });
+    }
+    const { token, user } = await loginWithApple({
+      identityToken: identity_token,
+      email,
+      marketingConsent: marketing_consent,
+      tosAccepted: tos_accepted,
+    });
+    res.json({ token, user });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to sign in with Apple' });
+  }
+});
+
+app.post('/api/auth/logout', requireAuth, async (req, res) => {
+  const header = req.headers.authorization || '';
+  await logout(header.slice(7));
+  res.json({ ok: true });
+});
+
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+  const result = await pool.query(
+    'SELECT id, email, tier, include_recurring_bills FROM users WHERE id = $1',
+    [req.userId]
+  );
+  res.json(result.rows[0] || null);
+});
+
+app.post('/api/user/include_recurring_bills', requireAuth, async (req, res) => {
+  try {
+    const { include } = req.body;
+    await pool.query('UPDATE users SET include_recurring_bills = $1 WHERE id = $2', [!!include, req.userId]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update preference' });
+  }
+});
+
+// Self-service, immediate, no grace period - per the spec. Plaid Items are removed on
+// Plaid's side first (so we stop being billed for them), then the user row is deleted,
+// which cascades to every other table (transactions, budgets, expenses, bills, sessions).
+app.delete('/api/account', requireAuth, async (req, res) => {
+  try {
+    const items = await pool.query('SELECT access_token FROM plaid_items WHERE user_id = $1', [req.userId]);
+    for (const item of items.rows) {
+      try {
+        await plaidClient.itemRemove({ access_token: item.access_token });
+      } catch (err) {
+        console.error(err.response ? err.response.data : err);
+      }
+    }
+
+    await pool.query('DELETE FROM users WHERE id = $1', [req.userId]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete account' });
+  }
+});
+
+// Everything below this point requires a valid session.
+app.use('/api', requireAuth);
+
+// Free tier is manual-entry only per the spec - Plaid sync is the paid feature.
+async function requirePaidTier(req, res, next) {
+  const result = await pool.query('SELECT tier FROM users WHERE id = $1', [req.userId]);
+  if (result.rows[0]?.tier !== 'paid') {
+    return res.status(403).json({ error: 'Connecting a bank requires the paid tier.' });
+  }
+  next();
+}
+
+// Step 1: front-end asks us for a link_token, which is what initializes Plaid Link.
+//
+// If item_id is provided, this instead creates a link_token in "update mode" for that
+// specific existing connection - used to re-authenticate a bank that broke (expired
+// login, MFA change, etc.) rather than creating a brand new connection.
+app.post('/api/create_link_token', requirePaidTier, async (req, res) => {
+  try {
+    const { item_id } = req.body || {};
+
+    if (item_id) {
+      const item = await pool.query('SELECT access_token FROM plaid_items WHERE id = $1 AND user_id = $2', [
+        item_id,
+        req.userId,
+      ]);
+      if (item.rows.length === 0) {
+        return res.status(404).json({ error: 'Bank connection not found' });
+      }
+      const response = await plaidClient.linkTokenCreate({
+        user: { client_user_id: String(req.userId) },
+        client_name: 'Fenn',
+        access_token: item.rows[0].access_token,
+        country_codes: ['US'],
+        language: 'en',
+      });
+      return res.json({ link_token: response.data.link_token });
+    }
+
+    const response = await plaidClient.linkTokenCreate({
+      user: { client_user_id: String(req.userId) },
+      client_name: 'Fenn',
+      products: ['transactions'],
+      country_codes: ['US'],
+      language: 'en',
+    });
+    res.json({ link_token: response.data.link_token });
+  } catch (err) {
+    console.error(err.response ? err.response.data : err);
+    res.status(500).json({ error: 'Failed to create link token' });
+  }
+});
+
+// Called after a successful update-mode Link session - the access_token doesn't change,
+// we just clear the flag so the reconnect banner goes away.
+app.post('/api/plaid_items/:id/reconnected', async (req, res) => {
+  try {
+    await pool.query('UPDATE plaid_items SET needs_reconnect = false WHERE id = $1 AND user_id = $2', [
+      req.params.id,
+      req.userId,
+    ]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update bank connection' });
+  }
+});
+
+// Disconnects one linked bank without touching the rest of the account - the only other
+// way to remove a bank connection is deleting the whole account, which is too heavy a
+// hammer for "I connected the wrong bank." Removed on Plaid's side first (so billing
+// stops), then the row is deleted, which cascades to that bank's transactions and
+// recurring bills only.
+app.delete('/api/plaid_items/:id', async (req, res) => {
+  try {
+    const item = await pool.query('SELECT access_token FROM plaid_items WHERE id = $1 AND user_id = $2', [
+      req.params.id,
+      req.userId,
+    ]);
+    if (item.rows.length === 0) {
+      return res.status(404).json({ error: 'Bank connection not found' });
+    }
+
+    try {
+      await plaidClient.itemRemove({ access_token: item.rows[0].access_token });
+    } catch (err) {
+      console.error(err.response ? err.response.data : err);
+    }
+
+    await pool.query('DELETE FROM plaid_items WHERE id = $1 AND user_id = $2', [req.params.id, req.userId]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to remove bank connection' });
+  }
+});
+
+// Step 2: once the user finishes Plaid Link, the front-end sends us the public_token.
+// We exchange it for a long-lived access_token and save it against the user's row.
+app.post('/api/exchange_public_token', requirePaidTier, async (req, res) => {
+  try {
+    const { public_token, institution_name } = req.body;
+    const response = await plaidClient.itemPublicTokenExchange({ public_token });
+    const userId = req.userId;
+
+    await pool.query(
+      `INSERT INTO plaid_items (user_id, plaid_item_id, access_token, institution_name)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (plaid_item_id) DO UPDATE SET access_token = EXCLUDED.access_token`,
+      [userId, response.data.item_id, response.data.access_token, institution_name || null]
+    );
+
+    res.json({ item_id: response.data.item_id });
+  } catch (err) {
+    console.error(err.response ? err.response.data : err);
+    res.status(500).json({ error: 'Failed to exchange public token' });
+  }
+});
+
+// Pulls transactions for one bank connection via Plaid's sync endpoint and upserts them
+// into our own transactions table. Returns how many were added/modified/removed.
+async function syncOneItem(item, userId) {
+  let cursor = item.cursor;
+  let added = [];
+  let modified = [];
+  let removed = [];
+  let hasMore = true;
+
+  while (hasMore) {
+    const response = await plaidClient.transactionsSync({
+      access_token: item.access_token,
+      cursor: cursor || undefined,
+    });
+    added = added.concat(response.data.added);
+    modified = modified.concat(response.data.modified);
+    removed = removed.concat(response.data.removed);
+    hasMore = response.data.has_more;
+    cursor = response.data.next_cursor;
+  }
+
+  for (const txn of added.concat(modified)) {
+    const pfc = txn.personal_finance_category || {};
+    await pool.query(
+      `INSERT INTO transactions
+         (plaid_item_id, user_id, plaid_transaction_id, account_id, amount, iso_currency_code, date, name, merchant_name, pending, pfc_primary, pfc_detailed, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+       ON CONFLICT (plaid_transaction_id) DO UPDATE SET
+         amount = EXCLUDED.amount,
+         date = EXCLUDED.date,
+         name = EXCLUDED.name,
+         merchant_name = EXCLUDED.merchant_name,
+         pending = EXCLUDED.pending,
+         pfc_primary = EXCLUDED.pfc_primary,
+         pfc_detailed = EXCLUDED.pfc_detailed,
+         updated_at = now()`,
+      [
+        item.id,
+        userId,
+        txn.transaction_id,
+        txn.account_id,
+        txn.amount,
+        txn.iso_currency_code,
+        txn.date,
+        txn.name,
+        txn.merchant_name,
+        txn.pending,
+        pfc.primary || null,
+        pfc.detailed || null,
+      ]
+    );
+  }
+
+  if (removed.length > 0) {
+    const removedIds = removed.map((r) => r.transaction_id);
+    await pool.query('DELETE FROM transactions WHERE plaid_transaction_id = ANY($1)', [removedIds]);
+  }
+
+  await pool.query('UPDATE plaid_items SET cursor = $1 WHERE id = $2', [cursor, item.id]);
+
+  return { added: added.length, modified: modified.length, removed: removed.length };
+}
+
+// Step 3: pull transactions for every bank connection this user has.
+app.post('/api/sync_transactions', async (req, res) => {
+  try {
+    const userId = req.userId;
+    const items = await pool.query(
+      'SELECT id, plaid_item_id, access_token, cursor FROM plaid_items WHERE user_id = $1',
+      [userId]
+    );
+
+    if (items.rows.length === 0) {
+      return res.status(400).json({ error: 'No linked account yet. Connect a bank first.' });
+    }
+
+    let totalAdded = 0;
+    let totalModified = 0;
+    let totalRemoved = 0;
+    const needsReconnect = [];
+
+    for (const item of items.rows) {
+      // One bank's connection breaking (expired login, MFA change, etc.) shouldn't stop
+      // the others from syncing - catch per-item so a single bad Item doesn't fail the
+      // whole request for someone with several banks connected.
+      try {
+        const counts = await syncOneItem(item, userId);
+        totalAdded += counts.added;
+        totalModified += counts.modified;
+        totalRemoved += counts.removed;
+      } catch (err) {
+        const errorCode = err.response?.data?.error_code;
+        if (errorCode === 'ITEM_LOGIN_REQUIRED') {
+          await pool.query('UPDATE plaid_items SET needs_reconnect = true WHERE id = $1', [item.id]);
+          needsReconnect.push(item.id);
+        } else {
+          console.error(err.response ? err.response.data : err);
+        }
+      }
+    }
+
+    res.json({ added: totalAdded, modified: totalModified, removed: totalRemoved, needsReconnect });
+  } catch (err) {
+    console.error(err.response ? err.response.data : err);
+    res.status(500).json({ error: 'Failed to sync transactions' });
+  }
+});
+
+// Plaid categories that should never count toward daily spend, per the spec:
+// transfers between the user's own accounts, and credit card bill payments
+// (the underlying purchases were already counted when they happened).
+const AUTO_EXCLUDED_PFC_PRIMARY = ['TRANSFER_IN', 'TRANSFER_OUT'];
+const AUTO_EXCLUDED_PFC_DETAILED = ['LOAN_PAYMENTS_CREDIT_CARD_PAYMENT'];
+
+// Read-only view of what's actually in our database now, for testing/verification.
+app.get('/api/transactions', async (req, res) => {
+  try {
+    const { date } = req.query;
+    const userId = req.userId;
+
+    if (date) {
+      // Returns every transaction for the day, not just the ones counted in the total,
+      // so the app can show excluded transactions (and let the user toggle them back)
+      // instead of them silently vanishing once excluded.
+      //
+      // Refunds (negative amount) are auto-excluded rather than subtracted from spend -
+      // matching a refund to the original purchase isn't reliable, and letting a refund
+      // net negative for the day creates artificial budget headroom for the rest of the
+      // period. If someone wants a specific refund to count, they can toggle it back on.
+      const userRow = await pool.query('SELECT include_recurring_bills FROM users WHERE id = $1', [userId]);
+      const includeRecurringBills = userRow.rows[0]?.include_recurring_bills || false;
+
+      const result = await pool.query(
+        `SELECT t.id, t.date, t.name, t.merchant_name, t.amount, t.pending, t.user_excluded,
+           (COALESCE(t.pfc_primary, '') = ANY($3) OR COALESCE(t.pfc_detailed, '') = ANY($4)
+            OR (t.is_recurring_bill AND NOT ($5 AND COALESCE(rb.included_in_spend, true))) OR t.amount <= 0) AS auto_excluded
+         FROM transactions t
+         LEFT JOIN recurring_bills rb ON rb.id = t.recurring_bill_id
+         WHERE t.user_id = $1 AND t.date = $2
+         ORDER BY t.id`,
+        [userId, date, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, includeRecurringBills]
+      );
+      return res.json(result.rows);
+    }
+
+    const result = await pool.query(
+      `SELECT id, date, name, merchant_name, amount, pending, pfc_primary, pfc_detailed, user_excluded
+       FROM transactions WHERE user_id = $1 ORDER BY date DESC LIMIT 100`,
+      [userId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch transactions' });
+  }
+});
+
+app.get('/api/plaid_items', async (req, res) => {
+  try {
+    const userId = req.userId;
+    const result = await pool.query(
+      'SELECT id, institution_name, needs_reconnect, created_at FROM plaid_items WHERE user_id = $1 ORDER BY created_at',
+      [userId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch linked banks' });
+  }
+});
+
+// Fetches recurring transaction streams from Plaid for every linked bank and stores the
+// outflow ones (recurring bills - rent, subscriptions, utilities). Not called on every
+// regular sync; it's a heavier Plaid call, meant to be triggered when the Bills view loads.
+app.post('/api/sync_recurring', async (req, res) => {
+  try {
+    const userId = req.userId;
+    const items = await pool.query('SELECT id, access_token FROM plaid_items WHERE user_id = $1', [userId]);
+
+    for (const item of items.rows) {
+      const response = await plaidClient.transactionsRecurringGet({ access_token: item.access_token });
+
+      for (const stream of response.data.outflow_streams) {
+        // Belt-and-suspenders: outflow_streams should already exclude income/refunds
+        // (those land in inflow_streams, which we never fetch), but never store a
+        // stream that isn't a genuine positive-amount recurring expense.
+        if (!(stream.average_amount?.amount > 0)) continue;
+
+        const billResult = await pool.query(
+          `INSERT INTO recurring_bills
+             (user_id, plaid_item_id, stream_id, merchant_name, description, average_amount, last_amount, frequency, last_date, is_active, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+           ON CONFLICT (stream_id) DO UPDATE SET
+             merchant_name = EXCLUDED.merchant_name,
+             average_amount = EXCLUDED.average_amount,
+             last_amount = EXCLUDED.last_amount,
+             frequency = EXCLUDED.frequency,
+             last_date = EXCLUDED.last_date,
+             is_active = EXCLUDED.is_active,
+             updated_at = now()
+           RETURNING id`,
+          [
+            userId,
+            item.id,
+            stream.stream_id,
+            stream.merchant_name,
+            stream.description,
+            stream.average_amount?.amount ?? null,
+            stream.last_amount?.amount ?? null,
+            stream.frequency,
+            stream.last_date,
+            stream.is_active,
+          ]
+        );
+
+        if (stream.transaction_ids.length > 0) {
+          await pool.query(
+            'UPDATE transactions SET is_recurring_bill = true, recurring_bill_id = $2 WHERE plaid_transaction_id = ANY($1)',
+            [stream.transaction_ids, billResult.rows[0].id]
+          );
+        }
+      }
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err.response ? err.response.data : err);
+    res.status(500).json({ error: 'Failed to sync recurring bills' });
+  }
+});
+
+app.get('/api/bills', async (req, res) => {
+  try {
+    const userId = req.userId;
+    const result = await pool.query(
+      `SELECT id, merchant_name, description, average_amount, last_amount, frequency, last_date, is_active, included_in_spend
+       FROM recurring_bills
+       WHERE user_id = $1 AND is_active = true AND average_amount > 0
+       ORDER BY average_amount DESC`,
+      [userId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch bills' });
+  }
+});
+
+// Per-bill override, only meaningful once the user's global include_recurring_bills
+// toggle is on - lets someone opt specific bills into spend individually.
+app.patch('/api/bills/:id/include', async (req, res) => {
+  try {
+    const { included } = req.body;
+    await pool.query(
+      'UPDATE recurring_bills SET included_in_spend = $1 WHERE id = $2 AND user_id = $3',
+      [!!included, req.params.id, req.userId]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update bill' });
+  }
+});
+
+// Bulk shortcut for the "Include all" choice - bills default to excluded individually, so
+// this is the fast path for someone who wants every recurring bill counted, without
+// stepping through the per-bill picker.
+app.post('/api/bills/include_all', async (req, res) => {
+  try {
+    await pool.query('UPDATE recurring_bills SET included_in_spend = true WHERE user_id = $1', [req.userId]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update bills' });
+  }
+});
+
+app.get('/api/budget', async (req, res) => {
+  try {
+    const userId = req.userId;
+    const result = await pool.query('SELECT monthly_amount, week_start_day FROM budgets WHERE user_id = $1', [userId]);
+    res.json(result.rows[0] || null);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch budget' });
+  }
+});
+
+app.post('/api/budget', async (req, res) => {
+  try {
+    const { monthly_amount, week_start_day } = req.body;
+    if (!monthly_amount || monthly_amount <= 0) {
+      return res.status(400).json({ error: 'monthly_amount must be a positive number' });
+    }
+    const userId = req.userId;
+    await pool.query(
+      `INSERT INTO budgets (user_id, monthly_amount, week_start_day, updated_at)
+       VALUES ($1, $2, $3, now())
+       ON CONFLICT (user_id) DO UPDATE SET
+         monthly_amount = EXCLUDED.monthly_amount,
+         week_start_day = EXCLUDED.week_start_day,
+         updated_at = now()`,
+      [userId, monthly_amount, week_start_day ?? 0]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to save budget' });
+  }
+});
+
+app.get('/api/expenses', async (req, res) => {
+  try {
+    const { date } = req.query;
+    if (!date) {
+      return res.status(400).json({ error: 'date query param (YYYY-MM-DD) is required' });
+    }
+    const userId = req.userId;
+    const result = await pool.query(
+      'SELECT id, amount, note, occurred_at FROM manual_expenses WHERE user_id = $1 AND local_date = $2 ORDER BY occurred_at DESC',
+      [userId, date]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch expenses' });
+  }
+});
+
+app.post('/api/expenses', async (req, res) => {
+  try {
+    const { amount, note, local_date, occurred_at } = req.body;
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: 'amount must be a positive number' });
+    }
+    if (!local_date) {
+      return res.status(400).json({ error: 'local_date (YYYY-MM-DD, the device\'s local calendar date) is required' });
+    }
+    const userId = req.userId;
+    const result = await pool.query(
+      `INSERT INTO manual_expenses (user_id, amount, note, local_date, occurred_at)
+       VALUES ($1, $2, $3, $4, COALESCE($5, now()))
+       RETURNING id, amount, note, local_date, occurred_at`,
+      [userId, amount, note || null, local_date, occurred_at || null]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to add expense' });
+  }
+});
+
+app.delete('/api/expenses/:id', async (req, res) => {
+  try {
+    const userId = req.userId;
+    await pool.query('DELETE FROM manual_expenses WHERE id = $1 AND user_id = $2', [req.params.id, userId]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete expense' });
+  }
+});
+
+// Toggle whether a single synced transaction counts toward the budget
+// (e.g. excluding a one-off flight). Plaid transactions are never deleted, only excluded.
+app.patch('/api/transactions/:id/exclude', async (req, res) => {
+  try {
+    const { excluded } = req.body;
+    const userId = req.userId;
+    await pool.query('UPDATE transactions SET user_excluded = $1 WHERE id = $2 AND user_id = $3', [
+      !!excluded,
+      req.params.id,
+      userId,
+    ]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update transaction' });
+  }
+});
+
+// Total spend in a date range (inclusive), combining manual expenses and synced
+// transactions, after applying the auto-exclusion rules and any manual exclusions.
+// The client supplies the date range so timezone/"what day is today" stays a device concern.
+async function getIncludeRecurringBills(userId) {
+  const result = await pool.query('SELECT include_recurring_bills FROM users WHERE id = $1', [userId]);
+  return result.rows[0]?.include_recurring_bills || false;
+}
+
+app.get('/api/spend', async (req, res) => {
+  try {
+    const { start, end } = req.query;
+    if (!start || !end) {
+      return res.status(400).json({ error: 'start and end query params (YYYY-MM-DD) are required' });
+    }
+    const userId = req.userId;
+    const includeRecurringBills = await getIncludeRecurringBills(userId);
+
+    const plaidResult = await pool.query(
+      `SELECT COALESCE(SUM(t.amount), 0) AS total FROM transactions t
+       LEFT JOIN recurring_bills rb ON rb.id = t.recurring_bill_id
+       WHERE t.user_id = $1
+         AND t.date BETWEEN $2 AND $3
+         AND t.user_excluded = false
+         AND (t.is_recurring_bill = false OR ($6 AND COALESCE(rb.included_in_spend, true)))
+         AND t.amount > 0
+         AND COALESCE(t.pfc_primary, '') != ALL($4)
+         AND COALESCE(t.pfc_detailed, '') != ALL($5)`,
+      [userId, start, end, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, includeRecurringBills]
+    );
+
+    const manualResult = await pool.query(
+      `SELECT COALESCE(SUM(amount), 0) AS total FROM manual_expenses
+       WHERE user_id = $1 AND local_date BETWEEN $2 AND $3`,
+      [userId, start, end]
+    );
+
+    const total = Number(plaidResult.rows[0].total) + Number(manualResult.rows[0].total);
+    res.json({ start, end, spent: total });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to compute spend' });
+  }
+});
+
+// Same spend calculation as /api/spend, but broken out per calendar day (including
+// zero-spend days) for the streak/history views, which need to know under/over per day.
+app.get('/api/spend/daily', async (req, res) => {
+  try {
+    const { start, end } = req.query;
+    if (!start || !end) {
+      return res.status(400).json({ error: 'start and end query params (YYYY-MM-DD) are required' });
+    }
+    const userId = req.userId;
+    const includeRecurringBills = await getIncludeRecurringBills(userId);
+
+    const result = await pool.query(
+      `SELECT gs::date AS date, COALESCE(t.total, 0) + COALESCE(m.total, 0) AS spent
+       FROM generate_series($2::date, $3::date, interval '1 day') AS gs
+       LEFT JOIN (
+         SELECT t.date, SUM(t.amount) AS total FROM transactions t
+         LEFT JOIN recurring_bills rb ON rb.id = t.recurring_bill_id
+         WHERE t.user_id = $1
+           AND t.user_excluded = false
+           AND (t.is_recurring_bill = false OR ($6 AND COALESCE(rb.included_in_spend, true)))
+           AND t.amount > 0
+           AND COALESCE(t.pfc_primary, '') != ALL($4)
+           AND COALESCE(t.pfc_detailed, '') != ALL($5)
+         GROUP BY t.date
+       ) t ON t.date = gs::date
+       LEFT JOIN (
+         SELECT local_date, SUM(amount) AS total FROM manual_expenses
+         WHERE user_id = $1
+         GROUP BY local_date
+       ) m ON m.local_date = gs::date
+       ORDER BY gs`,
+      [userId, start, end, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, includeRecurringBills]
+    );
+
+    res.json(result.rows.map((r) => ({ date: toDateOnly(r.date), spent: Number(r.spent) })));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to compute daily spend' });
+  }
+});
+
+const PORT = process.env.PORT || 8000;
+app.listen(PORT, () => console.log(`Fenn backend listening on http://localhost:${PORT}`));
