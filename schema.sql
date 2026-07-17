@@ -119,6 +119,16 @@ CREATE TABLE IF NOT EXISTS recurring_bills (
 -- Superseded by transactions.user_excluded's tri-state override - see the comment there.
 ALTER TABLE recurring_bills DROP COLUMN IF EXISTS included_in_spend;
 
+-- Plaid's recurring-stream object carries its own personal_finance_category directly (the
+-- same shape as a transaction's), so "is this bill secretly a transfer/credit-card
+-- payment" can be checked without joining to a linked transaction. That join was the only
+-- way to do this before, and it silently broke the moment a bill's linked transactions
+-- were absent for any reason (deleted, not yet synced, pre-connection cleanup) - with
+-- nothing to join against, the filter would just find nothing to exclude, quietly showing
+-- bills that should have been hidden as transfers.
+ALTER TABLE recurring_bills ADD COLUMN IF NOT EXISTS pfc_primary TEXT;
+ALTER TABLE recurring_bills ADD COLUMN IF NOT EXISTS pfc_detailed TEXT;
+
 -- Links a transaction back to the recurring-bill stream it belongs to (set alongside
 -- is_recurring_bill during /api/sync_recurring), so per-bill inclusion choices can be
 -- applied when computing spend.

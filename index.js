@@ -467,8 +467,8 @@ app.post('/api/sync_recurring', async (req, res) => {
 
         const billResult = await pool.query(
           `INSERT INTO recurring_bills
-             (user_id, plaid_item_id, stream_id, merchant_name, description, average_amount, last_amount, frequency, last_date, is_active, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+             (user_id, plaid_item_id, stream_id, merchant_name, description, average_amount, last_amount, frequency, last_date, is_active, pfc_primary, pfc_detailed, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
            ON CONFLICT (stream_id) DO UPDATE SET
              merchant_name = EXCLUDED.merchant_name,
              average_amount = EXCLUDED.average_amount,
@@ -476,6 +476,8 @@ app.post('/api/sync_recurring', async (req, res) => {
              frequency = EXCLUDED.frequency,
              last_date = EXCLUDED.last_date,
              is_active = EXCLUDED.is_active,
+             pfc_primary = EXCLUDED.pfc_primary,
+             pfc_detailed = EXCLUDED.pfc_detailed,
              updated_at = now()
            RETURNING id`,
           [
@@ -489,6 +491,8 @@ app.post('/api/sync_recurring', async (req, res) => {
             stream.frequency,
             stream.last_date,
             stream.is_active,
+            stream.personal_finance_category?.primary ?? null,
+            stream.personal_finance_category?.detailed ?? null,
           ]
         );
 
@@ -518,24 +522,25 @@ app.get('/api/bills', async (req, res) => {
       // entirely. They can still be individually included from the expense list like any
       // other transaction, via the per-transaction override.
       //
+      // Checked against the bill's own pfc_primary/pfc_detailed (populated directly from
+      // Plaid's stream object in /api/sync_recurring), not a joined transaction - a join
+      // depends on a linked transaction existing, and that link can legitimately be absent
+      // (not yet synced, or - as happened once already - deleted for predating the
+      // connection date), which silently made this filter find nothing to exclude instead
+      // of failing loudly.
+      //
       // rb.last_date >= the connection date matters for the same reason syncOneItem only
       // keeps transactions from that date forward: Plaid's recurring detector runs against
       // its own full historical view regardless of when the Item was actually connected, so
       // without this a bill whose last real occurrence predates the connection - something
-      // Fenn has otherwise decided not to count at all - would still show up here. It also
-      // keeps this list self-consistent with the transfer/credit-card-payment filter above,
-      // which depends on a linked transaction existing: syncOneItem won't have a row to link
-      // to for any occurrence older than the connection date either.
+      // Fenn has otherwise decided not to count at all - would still show up here.
       `SELECT rb.id, rb.merchant_name, rb.description, rb.average_amount, rb.last_amount, rb.frequency, rb.last_date, rb.is_active
        FROM recurring_bills rb
        JOIN plaid_items pi ON pi.id = rb.plaid_item_id
        WHERE rb.user_id = $1 AND rb.is_active = true AND rb.average_amount > 0
          AND rb.last_date >= pi.created_at::date
-         AND NOT EXISTS (
-           SELECT 1 FROM transactions t
-           WHERE t.recurring_bill_id = rb.id
-             AND (COALESCE(t.pfc_primary, '') = ANY($2) OR COALESCE(t.pfc_detailed, '') = ANY($3))
-         )
+         AND COALESCE(rb.pfc_primary, '') != ALL($2)
+         AND COALESCE(rb.pfc_detailed, '') != ALL($3)
        ORDER BY rb.average_amount DESC`,
       [userId, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED]
     );
