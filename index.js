@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const plaidClient = require('./plaidClient');
 const pool = require('./db');
+const { encryptToken, decryptToken } = require('./tokenCrypto');
 const { register, login, loginWithApple, logout, requireAuth } = require('./auth');
 
 const app = express();
@@ -95,7 +96,7 @@ app.delete('/api/account', requireAuth, async (req, res) => {
     const items = await pool.query('SELECT access_token FROM plaid_items WHERE user_id = $1', [req.userId]);
     for (const item of items.rows) {
       try {
-        await plaidClient.itemRemove({ access_token: item.access_token });
+        await plaidClient.itemRemove({ access_token: decryptToken(item.access_token) });
       } catch (err) {
         console.error(err.response ? err.response.data : err);
       }
@@ -141,7 +142,7 @@ app.post('/api/create_link_token', requirePaidTier, async (req, res) => {
       const response = await plaidClient.linkTokenCreate({
         user: { client_user_id: String(req.userId) },
         client_name: 'Fenn',
-        access_token: item.rows[0].access_token,
+        access_token: decryptToken(item.rows[0].access_token),
         country_codes: ['US'],
         language: 'en',
       });
@@ -193,7 +194,7 @@ app.delete('/api/plaid_items/:id', async (req, res) => {
     }
 
     try {
-      await plaidClient.itemRemove({ access_token: item.rows[0].access_token });
+      await plaidClient.itemRemove({ access_token: decryptToken(item.rows[0].access_token) });
     } catch (err) {
       console.error(err.response ? err.response.data : err);
     }
@@ -218,7 +219,7 @@ app.post('/api/exchange_public_token', requirePaidTier, async (req, res) => {
       `INSERT INTO plaid_items (user_id, plaid_item_id, access_token, institution_name)
        VALUES ($1, $2, $3, $4)
        ON CONFLICT (plaid_item_id) DO UPDATE SET access_token = EXCLUDED.access_token`,
-      [userId, response.data.item_id, response.data.access_token, institution_name || null]
+      [userId, response.data.item_id, encryptToken(response.data.access_token), institution_name || null]
     );
 
     res.json({ item_id: response.data.item_id });
@@ -231,6 +232,7 @@ app.post('/api/exchange_public_token', requirePaidTier, async (req, res) => {
 // Pulls transactions for one bank connection via Plaid's sync endpoint and upserts them
 // into our own transactions table. Returns how many were added/modified/removed.
 async function syncOneItem(item, userId) {
+  const accessToken = decryptToken(item.access_token);
   let cursor = item.cursor;
   let added = [];
   let modified = [];
@@ -239,7 +241,7 @@ async function syncOneItem(item, userId) {
 
   while (hasMore) {
     const response = await plaidClient.transactionsSync({
-      access_token: item.access_token,
+      access_token: accessToken,
       cursor: cursor || undefined,
     });
     added = added.concat(response.data.added);
@@ -421,7 +423,7 @@ app.post('/api/sync_recurring', async (req, res) => {
     const items = await pool.query('SELECT id, access_token FROM plaid_items WHERE user_id = $1', [userId]);
 
     for (const item of items.rows) {
-      const response = await plaidClient.transactionsRecurringGet({ access_token: item.access_token });
+      const response = await plaidClient.transactionsRecurringGet({ access_token: decryptToken(item.access_token) });
 
       for (const stream of response.data.outflow_streams) {
         // Belt-and-suspenders: outflow_streams should already exclude income/refunds
