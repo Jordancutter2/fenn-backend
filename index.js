@@ -517,9 +517,20 @@ app.get('/api/bills', async (req, res) => {
       // in any meaningful sense, so these are filtered out of this informational list
       // entirely. They can still be individually included from the expense list like any
       // other transaction, via the per-transaction override.
+      //
+      // rb.last_date >= the connection date matters for the same reason syncOneItem only
+      // keeps transactions from that date forward: Plaid's recurring detector runs against
+      // its own full historical view regardless of when the Item was actually connected, so
+      // without this a bill whose last real occurrence predates the connection - something
+      // Fenn has otherwise decided not to count at all - would still show up here. It also
+      // keeps this list self-consistent with the transfer/credit-card-payment filter above,
+      // which depends on a linked transaction existing: syncOneItem won't have a row to link
+      // to for any occurrence older than the connection date either.
       `SELECT rb.id, rb.merchant_name, rb.description, rb.average_amount, rb.last_amount, rb.frequency, rb.last_date, rb.is_active
        FROM recurring_bills rb
+       JOIN plaid_items pi ON pi.id = rb.plaid_item_id
        WHERE rb.user_id = $1 AND rb.is_active = true AND rb.average_amount > 0
+         AND rb.last_date >= pi.created_at::date
          AND NOT EXISTS (
            SELECT 1 FROM transactions t
            WHERE t.recurring_bill_id = rb.id
