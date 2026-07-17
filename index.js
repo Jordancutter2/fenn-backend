@@ -9,14 +9,18 @@ const { register, login, loginWithApple, logout, requireAuth } = require('./auth
 
 const app = express();
 // Required for express-rate-limit (and req.ip generally) to see the real client IP rather
-// than one of Railway's own proxy hops - without this every request looks like it's coming
-// from the same address, which would apply the rate limit globally across all users
-// instead of per-IP. Confirmed via a temporary debug endpoint that Railway's
-// X-Forwarded-For actually has two hops in front of this app (not the one originally
-// assumed), so trusting only 1 landed on the wrong (still-a-proxy) address. Trusting a
-// fixed hop count instead of an arbitrary chain still means a client can't spoof its way
-// past this via a forged X-Forwarded-For header.
-app.set('trust proxy', 2);
+// than one of Railway's own internal proxy hops - without this every request looks like
+// it's coming from the same (or, worse, a rotating pool of) address, which breaks per-IP
+// rate limiting entirely. A temporary debug endpoint showed Railway's internal hop count
+// isn't a fixed number worth hardcoding (a hop's own IP changed between two otherwise
+// identical requests, implying a pool of edge nodes, not one stable proxy) - trusting the
+// whole forwarded chain is the standard fix for platforms like this. Safe specifically
+// because Railway is the only possible ingress to this container: nothing reaches it
+// without passing through Railway's edge first, and a legitimate reverse proxy always
+// overwrites (never appends to) any X-Forwarded-For a client tries to supply, so the
+// leftmost entry this app ends up trusting is one Railway itself observed, not one a
+// client could forge.
+app.set('trust proxy', true);
 
 // TEMPORARY - remove once trust-proxy hop count is confirmed correct against Railway's
 // actual header shape.
