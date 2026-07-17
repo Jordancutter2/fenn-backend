@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 const { Configuration, PlaidApi, PlaidEnvironments } = require('plaid');
 
 const configuration = new Configuration({
