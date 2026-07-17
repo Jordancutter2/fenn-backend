@@ -719,4 +719,8 @@ app.get('/api/spend/earliest-date', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 8000;
-app.listen(PORT, () => console.log(`Fenn backend listening on http://localhost:${PORT}`));
+// Explicitly '0.0.0.0', not the default - on Railway (and similar container platforms)
+// the app can print this exact "listening" line successfully while still binding in a way
+// their edge proxy can't reach, producing a 502 "Application failed to respond" for every
+// request despite the process being alive and healthy the whole time.
+app.listen(PORT, '0.0.0.0', () => console.log(`Fenn backend listening on http://localhost:${PORT}`));
