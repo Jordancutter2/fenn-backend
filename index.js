@@ -22,12 +22,6 @@ const app = express();
 // client could forge.
 app.set('trust proxy', true);
 
-// TEMPORARY - remove once trust-proxy hop count is confirmed correct against Railway's
-// actual header shape.
-app.get('/api/_debug_ip', (req, res) => {
-  res.json({ reqIp: req.ip, xForwardedFor: req.headers['x-forwarded-for'] });
-});
-
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
