@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 const express = require('express');
 const cors = require('cors');
 const plaidClient = require('./plaidClient');
@@ -83,22 +83,8 @@ app.post('/api/auth/logout', requireAuth, async (req, res) => {
 });
 
 app.get('/api/auth/me', requireAuth, async (req, res) => {
-  const result = await pool.query(
-    'SELECT id, email, tier, include_recurring_bills FROM users WHERE id = $1',
-    [req.userId]
-  );
+  const result = await pool.query('SELECT id, email, tier FROM users WHERE id = $1', [req.userId]);
   res.json(result.rows[0] || null);
-});
-
-app.post('/api/user/include_recurring_bills', requireAuth, async (req, res) => {
-  try {
-    const { include } = req.body;
-    await pool.query('UPDATE users SET include_recurring_bills = $1 WHERE id = $2', [!!include, req.userId]);
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to update preference' });
-  }
 });
 
 // Self-service, immediate, no grace period - per the spec. Plaid Items are removed on
@@ -359,30 +345,43 @@ const AUTO_EXCLUDED_PFC_DETAILED = ['LOAN_PAYMENTS_CREDIT_CARD_PAYMENT'];
 // Read-only view of what's actually in our database now, for testing/verification.
 app.get('/api/transactions', async (req, res) => {
   try {
-    const { date } = req.query;
+    const { date, start, end } = req.query;
     const userId = req.userId;
 
-    if (date) {
-      // Returns every transaction for the day, not just the ones counted in the total,
-      // so the app can show excluded transactions (and let the user toggle them back)
-      // instead of them silently vanishing once excluded.
+    if (date || (start && end)) {
+      // Returns every transaction in range, not just the ones counted in the total, so
+      // the app can show excluded ones too (dimmed, with a toggle to bring them back)
+      // instead of them silently vanishing.
       //
-      // Refunds (negative amount) are auto-excluded rather than subtracted from spend -
-      // matching a refund to the original purchase isn't reliable, and letting a refund
-      // net negative for the day creates artificial budget headroom for the rest of the
-      // period. If someone wants a specific refund to count, they can toggle it back on.
-      const userRow = await pool.query('SELECT include_recurring_bills FROM users WHERE id = $1', [userId]);
-      const includeRecurringBills = userRow.rows[0]?.include_recurring_bills || false;
+      // user_excluded is a tri-state override: NULL defers to the automatic category
+      // rules below (a transfer, a credit card payment, or a recurring bill is excluded by
+      // default), true always excludes regardless of category, and false always includes
+      // regardless of category - which is what actually lets someone count one specific
+      // recurring bill without a separate settings toggle. Refunds (amount <= 0) are the
+      // one exception with no override in either direction: letting a refund subtract from
+      // spend can push a day/period negative, creating artificial budget headroom for the
+      // rest of it, which is a real problem independent of anyone's intent to include it.
+      const rangeStart = date || start;
+      const rangeEnd = date || end;
 
       const result = await pool.query(
-        `SELECT t.id, t.date, t.name, t.merchant_name, t.amount, t.pending, t.user_excluded,
-           (COALESCE(t.pfc_primary, '') = ANY($3) OR COALESCE(t.pfc_detailed, '') = ANY($4)
-            OR (t.is_recurring_bill AND NOT ($5 AND COALESCE(rb.included_in_spend, true))) OR t.amount <= 0) AS auto_excluded
+        // to_char, not a bare column - pg's driver otherwise serializes a raw DATE column
+        // as a full ISO timestamp shifted by the server's local timezone (e.g.
+        // "2026-07-13T06:00:00.000Z" for Mountain Time), not the plain "2026-07-13" every
+        // date-string helper in the app (parseDateKey, etc.) expects.
+        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pending,
+           CASE
+             WHEN t.amount <= 0 THEN true
+             WHEN t.user_excluded IS NOT NULL THEN t.user_excluded
+             ELSE (
+               COALESCE(t.pfc_primary, '') = ANY($3) OR COALESCE(t.pfc_detailed, '') = ANY($4)
+               OR t.is_recurring_bill
+             )
+           END AS excluded
          FROM transactions t
-         LEFT JOIN recurring_bills rb ON rb.id = t.recurring_bill_id
-         WHERE t.user_id = $1 AND t.date = $2
-         ORDER BY t.id`,
-        [userId, date, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, includeRecurringBills]
+         WHERE t.user_id = $1 AND t.date BETWEEN $2 AND $5
+         ORDER BY t.date DESC, t.id`,
+        [userId, rangeStart, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, rangeEnd]
       );
       return res.json(result.rows);
     }
@@ -477,45 +476,26 @@ app.get('/api/bills', async (req, res) => {
   try {
     const userId = req.userId;
     const result = await pool.query(
-      `SELECT id, merchant_name, description, average_amount, last_amount, frequency, last_date, is_active, included_in_spend
-       FROM recurring_bills
-       WHERE user_id = $1 AND is_active = true AND average_amount > 0
-       ORDER BY average_amount DESC`,
-      [userId]
+      // Plaid's recurring-transaction detector picks up genuine transfers too (most
+      // commonly a credit card payment that happens to recur monthly) - not a real "bill"
+      // in any meaningful sense, so these are filtered out of this informational list
+      // entirely. They can still be individually included from the expense list like any
+      // other transaction, via the per-transaction override.
+      `SELECT rb.id, rb.merchant_name, rb.description, rb.average_amount, rb.last_amount, rb.frequency, rb.last_date, rb.is_active
+       FROM recurring_bills rb
+       WHERE rb.user_id = $1 AND rb.is_active = true AND rb.average_amount > 0
+         AND NOT EXISTS (
+           SELECT 1 FROM transactions t
+           WHERE t.recurring_bill_id = rb.id
+             AND (COALESCE(t.pfc_primary, '') = ANY($2) OR COALESCE(t.pfc_detailed, '') = ANY($3))
+         )
+       ORDER BY rb.average_amount DESC`,
+      [userId, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED]
     );
     res.json(result.rows);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to fetch bills' });
-  }
-});
-
-// Per-bill override, only meaningful once the user's global include_recurring_bills
-// toggle is on - lets someone opt specific bills into spend individually.
-app.patch('/api/bills/:id/include', async (req, res) => {
-  try {
-    const { included } = req.body;
-    await pool.query(
-      'UPDATE recurring_bills SET included_in_spend = $1 WHERE id = $2 AND user_id = $3',
-      [!!included, req.params.id, req.userId]
-    );
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to update bill' });
-  }
-});
-
-// Bulk shortcut for the "Include all" choice - bills default to excluded individually, so
-// this is the fast path for someone who wants every recurring bill counted, without
-// stepping through the per-bill picker.
-app.post('/api/bills/include_all', async (req, res) => {
-  try {
-    await pool.query('UPDATE recurring_bills SET included_in_spend = true WHERE user_id = $1', [req.userId]);
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Failed to update bills' });
   }
 });
 
@@ -555,14 +535,17 @@ app.post('/api/budget', async (req, res) => {
 
 app.get('/api/expenses', async (req, res) => {
   try {
-    const { date } = req.query;
-    if (!date) {
-      return res.status(400).json({ error: 'date query param (YYYY-MM-DD) is required' });
+    const { date, start, end } = req.query;
+    if (!date && !(start && end)) {
+      return res.status(400).json({ error: 'date, or start and end, query params (YYYY-MM-DD) are required' });
     }
     const userId = req.userId;
+    const rangeStart = date || start;
+    const rangeEnd = date || end;
     const result = await pool.query(
-      'SELECT id, amount, note, occurred_at FROM manual_expenses WHERE user_id = $1 AND local_date = $2 ORDER BY occurred_at DESC',
-      [userId, date]
+      // to_char, not a bare column - see the equivalent note on /api/transactions above.
+      "SELECT id, amount, note, to_char(local_date, 'YYYY-MM-DD') AS local_date, occurred_at FROM manual_expenses WHERE user_id = $1 AND local_date BETWEEN $2 AND $3 ORDER BY occurred_at DESC",
+      [userId, rangeStart, rangeEnd]
     );
     res.json(result.rows);
   } catch (err) {
@@ -624,12 +607,29 @@ app.patch('/api/transactions/:id/exclude', async (req, res) => {
 });
 
 // Total spend in a date range (inclusive), combining manual expenses and synced
-// transactions, after applying the auto-exclusion rules and any manual exclusions.
-// The client supplies the date range so timezone/"what day is today" stays a device concern.
-async function getIncludeRecurringBills(userId) {
-  const result = await pool.query('SELECT include_recurring_bills FROM users WHERE id = $1', [userId]);
-  return result.rows[0]?.include_recurring_bills || false;
-}
+// transactions, after applying the automatic category rules and any per-transaction
+// override. The client supplies the date range so timezone/"what day is today" stays a
+// device concern.
+//
+// user_excluded is a tri-state override: NULL defers to the automatic rules (a transfer,
+// credit card payment, or recurring bill is excluded by default), false always counts a
+// transaction regardless of category, true always excludes it. Refunds (amount <= 0) are
+// the one exception with no override in either direction - see the comment above
+// /api/transactions for why.
+const COUNTS_TOWARD_SPEND = `
+  (
+    t.amount > 0
+    AND (
+      t.user_excluded = false
+      OR (
+        t.user_excluded IS NULL
+        AND t.is_recurring_bill = false
+        AND COALESCE(t.pfc_primary, '') != ALL($4)
+        AND COALESCE(t.pfc_detailed, '') != ALL($5)
+      )
+    )
+  )
+`;
 
 app.get('/api/spend', async (req, res) => {
   try {
@@ -638,19 +638,13 @@ app.get('/api/spend', async (req, res) => {
       return res.status(400).json({ error: 'start and end query params (YYYY-MM-DD) are required' });
     }
     const userId = req.userId;
-    const includeRecurringBills = await getIncludeRecurringBills(userId);
 
     const plaidResult = await pool.query(
       `SELECT COALESCE(SUM(t.amount), 0) AS total FROM transactions t
-       LEFT JOIN recurring_bills rb ON rb.id = t.recurring_bill_id
        WHERE t.user_id = $1
          AND t.date BETWEEN $2 AND $3
-         AND t.user_excluded = false
-         AND (t.is_recurring_bill = false OR ($6 AND COALESCE(rb.included_in_spend, true)))
-         AND t.amount > 0
-         AND COALESCE(t.pfc_primary, '') != ALL($4)
-         AND COALESCE(t.pfc_detailed, '') != ALL($5)`,
-      [userId, start, end, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, includeRecurringBills]
+         AND ${COUNTS_TOWARD_SPEND}`,
+      [userId, start, end, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED]
     );
 
     const manualResult = await pool.query(
@@ -676,20 +670,14 @@ app.get('/api/spend/daily', async (req, res) => {
       return res.status(400).json({ error: 'start and end query params (YYYY-MM-DD) are required' });
     }
     const userId = req.userId;
-    const includeRecurringBills = await getIncludeRecurringBills(userId);
 
     const result = await pool.query(
       `SELECT gs::date AS date, COALESCE(t.total, 0) + COALESCE(m.total, 0) AS spent
        FROM generate_series($2::date, $3::date, interval '1 day') AS gs
        LEFT JOIN (
          SELECT t.date, SUM(t.amount) AS total FROM transactions t
-         LEFT JOIN recurring_bills rb ON rb.id = t.recurring_bill_id
          WHERE t.user_id = $1
-           AND t.user_excluded = false
-           AND (t.is_recurring_bill = false OR ($6 AND COALESCE(rb.included_in_spend, true)))
-           AND t.amount > 0
-           AND COALESCE(t.pfc_primary, '') != ALL($4)
-           AND COALESCE(t.pfc_detailed, '') != ALL($5)
+           AND ${COUNTS_TOWARD_SPEND}
          GROUP BY t.date
        ) t ON t.date = gs::date
        LEFT JOIN (
@@ -698,13 +686,35 @@ app.get('/api/spend/daily', async (req, res) => {
          GROUP BY local_date
        ) m ON m.local_date = gs::date
        ORDER BY gs`,
-      [userId, start, end, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, includeRecurringBills]
+      [userId, start, end, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED]
     );
 
     res.json(result.rows.map((r) => ({ date: toDateOnly(r.date), spent: Number(r.spent) })));
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to compute daily spend' });
+  }
+});
+
+// Lets the History screen know when to stop offering "load earlier months" - not
+// filtered by COUNTS_TOWARD_SPEND, since this is about whether there's any data at all
+// for a month (even an excluded transfer/refund still means the bank connection had
+// activity that month), not about spend totals specifically.
+app.get('/api/spend/earliest-date', async (req, res) => {
+  try {
+    const userId = req.userId;
+    const result = await pool.query(
+      `SELECT LEAST(
+         (SELECT MIN(date) FROM transactions WHERE user_id = $1),
+         (SELECT MIN(local_date) FROM manual_expenses WHERE user_id = $1)
+       ) AS earliest`,
+      [userId]
+    );
+    const earliest = result.rows[0].earliest;
+    res.json({ earliest: earliest ? toDateOnly(earliest) : null });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to compute earliest date' });
   }
 });
 

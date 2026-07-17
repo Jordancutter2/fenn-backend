@@ -19,10 +19,11 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS marketing_consent BOOLEAN NOT NULL DE
 ALTER TABLE users ADD COLUMN IF NOT EXISTS tier TEXT NOT NULL DEFAULT 'free';
 -- Apple's stable per-user identifier (the JWT `sub` claim), null for email/password-only accounts.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_user_id TEXT UNIQUE;
--- Default (per the spec) is that recurring bills never count toward spend - they're
--- tracked separately in the Bills tab instead. Some people think of rent/subscriptions
--- as part of their daily budget math though, so this lets them opt into counting them.
-ALTER TABLE users ADD COLUMN IF NOT EXISTS include_recurring_bills BOOLEAN NOT NULL DEFAULT false;
+-- Superseded by a per-transaction override (transactions.user_excluded, tri-state) - a
+-- single global toggle plus a separate per-bill flag couldn't actually let someone include
+-- one specific transaction (a bill that's secretly a transfer, a refund, etc.), which was
+-- the whole point. Dropped instead of left dead since nothing reads it anymore.
+ALTER TABLE users DROP COLUMN IF EXISTS include_recurring_bills;
 
 -- Opaque bearer tokens. Deleted on logout; no expiry logic for v1 - the spec explicitly
 -- skips session timeouts since the biometric app lock already covers that ground.
@@ -73,6 +74,19 @@ ALTER TABLE transactions ADD COLUMN IF NOT EXISTS pfc_detailed TEXT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_excluded BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS is_recurring_bill BOOLEAN NOT NULL DEFAULT false;
 
+-- user_excluded is now a tri-state override, not a plain "manually excluded" flag: NULL
+-- means no override (defer to the automatic category rules - transfers, credit card
+-- payments, refunds, and recurring bills are excluded by default), true forces a
+-- transaction to never count, and false forces it to always count - overriding any
+-- auto-exclusion category. That last case (force-include something auto-excluded) is new;
+-- previously a recurring bill, transfer, or refund could never be individually turned back
+-- on. Existing false rows only ever meant "not manually excluded" under the old
+-- single-direction toggle, so they become NULL (defer to auto rules, the same real
+-- behavior); existing true rows keep their meaning unchanged.
+ALTER TABLE transactions ALTER COLUMN user_excluded DROP DEFAULT;
+ALTER TABLE transactions ALTER COLUMN user_excluded DROP NOT NULL;
+UPDATE transactions SET user_excluded = NULL WHERE user_excluded = false;
+
 CREATE INDEX IF NOT EXISTS idx_transactions_user_date ON transactions(user_id, date);
 
 -- Recurring bills, detected via Plaid's /transactions/recurring/get (outflow streams only -
@@ -94,12 +108,8 @@ CREATE TABLE IF NOT EXISTS recurring_bills (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Per-bill override for whether a specific recurring bill counts toward spend when the
--- user's global include_recurring_bills toggle is on. Defaults to false - turning the
--- master toggle on doesn't automatically count anything; the user opts specific bills in
--- (or taps "Include all" to flip every bill on at once).
-ALTER TABLE recurring_bills ADD COLUMN IF NOT EXISTS included_in_spend BOOLEAN NOT NULL DEFAULT false;
-ALTER TABLE recurring_bills ALTER COLUMN included_in_spend SET DEFAULT false;
+-- Superseded by transactions.user_excluded's tri-state override - see the comment there.
+ALTER TABLE recurring_bills DROP COLUMN IF EXISTS included_in_spend;
 
 -- Links a transaction back to the recurring-bill stream it belongs to (set alongside
 -- is_recurring_bill during /api/sync_recurring), so per-bill inclusion choices can be
