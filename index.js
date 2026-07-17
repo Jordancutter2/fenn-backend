@@ -15,6 +15,13 @@ const app = express();
 // of this app), not an arbitrary chain, so a client can't spoof its way past this via a
 // forged X-Forwarded-For header.
 app.set('trust proxy', 1);
+
+// TEMPORARY - remove once trust-proxy hop count is confirmed correct against Railway's
+// actual header shape.
+app.get('/api/_debug_ip', (req, res) => {
+  res.json({ reqIp: req.ip, xForwardedFor: req.headers['x-forwarded-for'] });
+});
+
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
