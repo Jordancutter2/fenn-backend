@@ -111,7 +111,7 @@ app.post('/api/auth/logout', requireAuth, async (req, res) => {
 });
 
 app.get('/api/auth/me', requireAuth, async (req, res) => {
-  const result = await pool.query('SELECT id, email, tier FROM users WHERE id = $1', [req.userId]);
+  const result = await pool.query('SELECT id, email, tier, created_at FROM users WHERE id = $1', [req.userId]);
   res.json(result.rows[0] || null);
 });
 
