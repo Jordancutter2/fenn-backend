@@ -260,6 +260,12 @@ app.post('/api/exchange_public_token', requirePaidTier, async (req, res) => {
 // into our own transactions table. Returns how many were added/modified/removed.
 async function syncOneItem(item, userId) {
   const accessToken = decryptToken(item.access_token);
+  // The date this bank was actually connected, in the same local-calendar-date-key format
+  // as transactions.date - see toDateOnly's comment for why that matters. A brand new
+  // Item's first sync backfills Plaid's own historical window (which can span months on
+  // some institutions), but Fenn tracks day-to-day spending and streaks starting from when
+  // someone begins using it, not a retroactive analysis of their whole banking history.
+  const connectedDateKey = toDateOnly(new Date(item.created_at));
   let cursor = item.cursor;
   let added = [];
   let modified = [];
@@ -279,6 +285,7 @@ async function syncOneItem(item, userId) {
   }
 
   for (const txn of added.concat(modified)) {
+    if (txn.date < connectedDateKey) continue;
     const pfc = txn.personal_finance_category || {};
     await pool.query(
       `INSERT INTO transactions
@@ -325,7 +332,7 @@ app.post('/api/sync_transactions', async (req, res) => {
   try {
     const userId = req.userId;
     const items = await pool.query(
-      'SELECT id, plaid_item_id, access_token, cursor FROM plaid_items WHERE user_id = $1',
+      'SELECT id, plaid_item_id, access_token, cursor, created_at FROM plaid_items WHERE user_id = $1',
       [userId]
     );
 
