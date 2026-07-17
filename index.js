@@ -9,12 +9,14 @@ const { register, login, loginWithApple, logout, requireAuth } = require('./auth
 
 const app = express();
 // Required for express-rate-limit (and req.ip generally) to see the real client IP rather
-// than Railway's own edge proxy IP - without this every request looks like it's coming
+// than one of Railway's own proxy hops - without this every request looks like it's coming
 // from the same address, which would apply the rate limit globally across all users
-// instead of per-IP. '1' trusts exactly one hop (Railway's edge, the only proxy in front
-// of this app), not an arbitrary chain, so a client can't spoof its way past this via a
-// forged X-Forwarded-For header.
-app.set('trust proxy', 1);
+// instead of per-IP. Confirmed via a temporary debug endpoint that Railway's
+// X-Forwarded-For actually has two hops in front of this app (not the one originally
+// assumed), so trusting only 1 landed on the wrong (still-a-proxy) address. Trusting a
+// fixed hop count instead of an arbitrary chain still means a client can't spoof its way
+// past this via a forged X-Forwarded-For header.
+app.set('trust proxy', 2);
 
 // TEMPORARY - remove once trust-proxy hop count is confirmed correct against Railway's
 // actual header shape.
