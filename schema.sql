@@ -25,14 +25,22 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_user_id TEXT UNIQUE;
 -- the whole point. Dropped instead of left dead since nothing reads it anymore.
 ALTER TABLE users DROP COLUMN IF EXISTS include_recurring_bills;
 
--- Opaque bearer tokens. Deleted on logout; no expiry logic for v1 - the spec explicitly
--- skips session timeouts since the biometric app lock already covers that ground.
+-- Opaque bearer tokens. Deleted on logout. Originally left with no expiry at all - the
+-- spec figured the biometric app lock already covered that ground - but that's only one
+-- control (someone who never enabled Face ID lock, or a token that leaks through some
+-- other channel like a log, isn't covered by it). last_used_at below adds a sliding
+-- expiration on top of, not instead of, the biometric lock.
 CREATE TABLE IF NOT EXISTS sessions (
   id SERIAL PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   token TEXT UNIQUE NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Sliding window: bumped (throttled to at most once/day per session, see requireAuth) on
+-- every authenticated request, so daily use never expires a session - only one that's
+-- genuinely been abandoned or leaked eventually stops working.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
 -- One row per bank connection (a Plaid "Item"). A user can have up to 5 per the spec.
 CREATE TABLE IF NOT EXISTS plaid_items (

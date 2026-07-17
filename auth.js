@@ -136,15 +136,37 @@ async function loginWithApple({ identityToken, email: emailFromClient, marketing
   return { token, user };
 }
 
+// Sliding expiration on top of (not instead of) the biometric app lock - see the comment
+// on sessions.last_used_at in schema.sql for why this exists.
+const SESSION_LIFETIME_DAYS = 90;
+// Only bump last_used_at when it's at least this stale, not on literally every request -
+// still gives a same-day-or-more-recent sliding window without a write on every request.
+const SESSION_REFRESH_THRESHOLD_DAYS = 1;
+
 async function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
 
-  const result = await pool.query('SELECT user_id FROM sessions WHERE token = $1', [token]);
+  const result = await pool.query(
+    `SELECT user_id FROM sessions
+     WHERE token = $1 AND last_used_at > now() - interval '${SESSION_LIFETIME_DAYS} days'`,
+    [token]
+  );
   if (result.rows.length === 0) return res.status(401).json({ error: 'Not authenticated' });
 
   req.userId = result.rows[0].user_id;
+
+  // Fire-and-forget - bumping the sliding window isn't worth adding latency to every
+  // authenticated request for, and a failure here isn't worth failing the request over.
+  pool
+    .query(
+      `UPDATE sessions SET last_used_at = now()
+       WHERE token = $1 AND last_used_at < now() - interval '${SESSION_REFRESH_THRESHOLD_DAYS} days'`,
+      [token]
+    )
+    .catch((err) => console.error('Failed to refresh session last_used_at:', err));
+
   next();
 }
 
