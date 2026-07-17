@@ -1,18 +1,38 @@
 require('dotenv').config({ quiet: true });
 const express = require('express');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const plaidClient = require('./plaidClient');
 const pool = require('./db');
 const { encryptToken, decryptToken } = require('./tokenCrypto');
 const { register, login, loginWithApple, logout, requireAuth } = require('./auth');
 
 const app = express();
+// Required for express-rate-limit (and req.ip generally) to see the real client IP rather
+// than Railway's own edge proxy IP - without this every request looks like it's coming
+// from the same address, which would apply the rate limit globally across all users
+// instead of per-IP. '1' trusts exactly one hop (Railway's edge, the only proxy in front
+// of this app), not an arbitrary chain, so a client can't spoof its way past this via a
+// forged X-Forwarded-For header.
+app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 app.use((req, res, next) => {
   console.log(`[request] ${req.method} ${req.originalUrl}`);
   next();
+});
+
+// Bcrypt's own cost factor already slows down a single guess, but that's not the same as
+// capping how many guesses an attacker gets - without this, nothing stops a sustained
+// brute-force run against a specific email over hours. Keyed by IP, not by email, so it
+// can't be used to lock a real user out by deliberately failing their login from elsewhere.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts. Try again later.' },
 });
 
 // node-postgres parses DATE columns into JS Date objects using the *local* timezone of
@@ -27,7 +47,7 @@ function toDateOnly(d) {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
     const { email, password, marketing_consent, tos_accepted } = req.body;
     if (!email || !EMAIL_RE.test(email)) {
@@ -46,7 +66,7 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
@@ -59,7 +79,7 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-app.post('/api/auth/apple', async (req, res) => {
+app.post('/api/auth/apple', authLimiter, async (req, res) => {
   try {
     const { identity_token, email, marketing_consent, tos_accepted } = req.body;
     if (!identity_token) {
