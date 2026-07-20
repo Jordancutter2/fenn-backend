@@ -78,6 +78,23 @@ async function logout(token) {
   await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
 }
 
+// Only for accounts that already have a password set - an Apple-only account has no
+// password_hash at all, and !user.password_hash correctly rejects that case the same way
+// login() does rather than needing a separate check.
+async function changePassword(userId, currentPassword, newPassword) {
+  const result = await pool.query('SELECT password_hash FROM users WHERE id = $1', [userId]);
+  const user = result.rows[0];
+
+  if (!user || !user.password_hash || !(await bcrypt.compare(currentPassword, user.password_hash))) {
+    const err = new Error('Current password is incorrect.');
+    err.status = 401;
+    throw err;
+  }
+
+  const newHash = await bcrypt.hash(newPassword, 10);
+  await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, userId]);
+}
+
 // Apple only sends the user's email on the very first authorization ever for this app -
 // every sign-in after that omits it, since Apple already told us once. The client passes
 // along whatever it has from that first time; the server is the source of truth once a
@@ -170,4 +187,4 @@ async function requireAuth(req, res, next) {
   next();
 }
 
-module.exports = { register, login, loginWithApple, logout, requireAuth };
+module.exports = { register, login, loginWithApple, logout, requireAuth, changePassword };

@@ -5,7 +5,7 @@ const rateLimit = require('express-rate-limit');
 const plaidClient = require('./plaidClient');
 const pool = require('./db');
 const { encryptToken, decryptToken } = require('./tokenCrypto');
-const { register, login, loginWithApple, logout, requireAuth } = require('./auth');
+const { register, login, loginWithApple, logout, requireAuth, changePassword } = require('./auth');
 
 const app = express();
 // Required for express-rate-limit (and req.ip generally) to see the real client IP rather
@@ -111,8 +111,30 @@ app.post('/api/auth/logout', requireAuth, async (req, res) => {
 });
 
 app.get('/api/auth/me', requireAuth, async (req, res) => {
-  const result = await pool.query('SELECT id, email, tier, created_at FROM users WHERE id = $1', [req.userId]);
+  // has_password (not the hash itself, which never leaves the server) lets the frontend
+  // decide whether "Change password" makes sense to show at all - an Apple-only account
+  // has no password to change.
+  const result = await pool.query(
+    'SELECT id, email, tier, created_at, (password_hash IS NOT NULL) AS has_password FROM users WHERE id = $1',
+    [req.userId]
+  );
   res.json(result.rows[0] || null);
+});
+
+app.post('/api/auth/change-password', requireAuth, async (req, res) => {
+  try {
+    const { current_password, new_password } = req.body;
+    if (!current_password || !new_password) {
+      return res.status(400).json({ error: 'Current and new password are required.' });
+    }
+    if (new_password.length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters.' });
+    }
+    await changePassword(req.userId, current_password, new_password);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to change password' });
+  }
 });
 
 // Self-service, immediate, no grace period - per the spec. Plaid Items are removed on
