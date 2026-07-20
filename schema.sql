@@ -129,6 +129,14 @@ ALTER TABLE recurring_bills DROP COLUMN IF EXISTS included_in_spend;
 ALTER TABLE recurring_bills ADD COLUMN IF NOT EXISTS pfc_primary TEXT;
 ALTER TABLE recurring_bills ADD COLUMN IF NOT EXISTS pfc_detailed TEXT;
 
+-- Bill-level convenience on top of (not a replacement for) transactions.user_excluded -
+-- toggling this from the Bills tab applies the same include/exclude choice to every
+-- transaction currently linked to the bill in one action, and to future ones as they're
+-- linked during /api/sync_recurring, rather than requiring each occurrence to be found
+-- and toggled individually from Today/History. A per-transaction toggle done afterward
+-- still wins for that one occurrence - this only sets the baseline, not a hard override.
+ALTER TABLE recurring_bills ADD COLUMN IF NOT EXISTS user_included BOOLEAN NOT NULL DEFAULT false;
+
 -- Links a transaction back to the recurring-bill stream it belongs to (set alongside
 -- is_recurring_bill during /api/sync_recurring), so per-bill inclusion choices can be
 -- applied when computing spend.

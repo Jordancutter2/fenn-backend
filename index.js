@@ -479,7 +479,7 @@ app.post('/api/sync_recurring', async (req, res) => {
              pfc_primary = EXCLUDED.pfc_primary,
              pfc_detailed = EXCLUDED.pfc_detailed,
              updated_at = now()
-           RETURNING id`,
+           RETURNING id, user_included`,
           [
             userId,
             item.id,
@@ -497,9 +497,17 @@ app.post('/api/sync_recurring', async (req, res) => {
         );
 
         if (stream.transaction_ids.length > 0) {
+          // A newly-linked transaction inherits the bill's include/exclude choice only if
+          // it doesn't already have its own individual override (user_excluded IS NULL) -
+          // this is what makes toggling a bill apply to future occurrences automatically,
+          // without silently clobbering a one-off exception someone already set on a
+          // specific past occurrence.
           await pool.query(
-            'UPDATE transactions SET is_recurring_bill = true, recurring_bill_id = $2 WHERE plaid_transaction_id = ANY($1)',
-            [stream.transaction_ids, billResult.rows[0].id]
+            `UPDATE transactions
+             SET is_recurring_bill = true, recurring_bill_id = $2,
+                 user_excluded = CASE WHEN user_excluded IS NULL AND $3 THEN false ELSE user_excluded END
+             WHERE plaid_transaction_id = ANY($1)`,
+            [stream.transaction_ids, billResult.rows[0].id, billResult.rows[0].user_included]
           );
         }
       }
@@ -534,7 +542,7 @@ app.get('/api/bills', async (req, res) => {
       // its own full historical view regardless of when the Item was actually connected, so
       // without this a bill whose last real occurrence predates the connection - something
       // Fenn has otherwise decided not to count at all - would still show up here.
-      `SELECT rb.id, rb.merchant_name, rb.description, rb.average_amount, rb.last_amount, rb.frequency, rb.last_date, rb.is_active
+      `SELECT rb.id, rb.merchant_name, rb.description, rb.average_amount, rb.last_amount, rb.frequency, rb.last_date, rb.is_active, rb.user_included
        FROM recurring_bills rb
        JOIN plaid_items pi ON pi.id = rb.plaid_item_id
        WHERE rb.user_id = $1 AND rb.is_active = true AND rb.average_amount > 0
@@ -548,6 +556,46 @@ app.get('/api/bills', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to fetch bills' });
+  }
+});
+
+// Toggling a bill applies the same include/exclude choice to every transaction currently
+// linked to it in one action - the whole point of this endpoint over just toggling
+// transactions individually from Today/History. A transaction's own override, set
+// afterward, still wins for that one occurrence (this only sets the baseline all of a
+// bill's transactions share, not a hard, unoverridable rule).
+app.patch('/api/bills/:id/include', async (req, res) => {
+  try {
+    const userId = req.userId;
+    const included = !!req.body.included;
+
+    const bill = await pool.query('SELECT id FROM recurring_bills WHERE id = $1 AND user_id = $2', [
+      req.params.id,
+      userId,
+    ]);
+    if (bill.rows.length === 0) {
+      return res.status(404).json({ error: 'Bill not found' });
+    }
+
+    await pool.query('UPDATE recurring_bills SET user_included = $1, updated_at = now() WHERE id = $2', [
+      included,
+      req.params.id,
+    ]);
+
+    // Un-including resets to NULL (defer to the automatic rule, which excludes a
+    // recurring bill by default) rather than an explicit false - false would be
+    // indistinguishable from "the user deliberately force-included this one occurrence
+    // and then changed their mind," which isn't what un-including the whole bill means.
+    await pool.query(
+      `UPDATE transactions SET user_excluded = $1
+       WHERE recurring_bill_id = $2 AND user_id = $3`,
+      [included ? false : null, req.params.id, userId]
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update bill' });
   }
 });
 
