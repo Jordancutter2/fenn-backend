@@ -256,16 +256,26 @@ app.post('/api/exchange_public_token', requirePaidTier, async (req, res) => {
   }
 });
 
+// How far back to keep Plaid's historical backfill on a brand new Item - separate from,
+// and much more permissive than, streak eligibility (which stays anchored to the account's
+// actual created_at everywhere it's used - see RingScreen.js and HistoryScreen.js on the
+// frontend). The two are deliberately different concepts now: this window gives context
+// (History, and lets recurring-bill detection work right away instead of waiting for a
+// pattern to naturally emerge post-signup) without letting old data inflate a streak.
+const DATA_IMPORT_LOOKBACK_DAYS = 90;
+
 // Pulls transactions for one bank connection via Plaid's sync endpoint and upserts them
 // into our own transactions table. Returns how many were added/modified/removed.
 async function syncOneItem(item, userId) {
   const accessToken = decryptToken(item.access_token);
-  // The date this bank was actually connected, in the same local-calendar-date-key format
-  // as transactions.date - see toDateOnly's comment for why that matters. A brand new
-  // Item's first sync backfills Plaid's own historical window (which can span months on
-  // some institutions), but Fenn tracks day-to-day spending and streaks starting from when
-  // someone begins using it, not a retroactive analysis of their whole banking history.
-  const connectedDateKey = toDateOnly(new Date(item.created_at));
+  // A brand new Item's first sync backfills Plaid's own historical window (which can span
+  // months on some institutions) - only the most recent DATA_IMPORT_LOOKBACK_DAYS of that
+  // is kept, in the same local-calendar-date-key format as transactions.date (see
+  // toDateOnly's comment for why that matters).
+  const connectedDate = new Date(item.created_at);
+  const importStartDate = new Date(connectedDate);
+  importStartDate.setDate(importStartDate.getDate() - DATA_IMPORT_LOOKBACK_DAYS);
+  const importStartDateKey = toDateOnly(importStartDate);
   let cursor = item.cursor;
   let added = [];
   let modified = [];
@@ -285,7 +295,7 @@ async function syncOneItem(item, userId) {
   }
 
   for (const txn of added.concat(modified)) {
-    if (txn.date < connectedDateKey) continue;
+    if (txn.date < importStartDateKey) continue;
     const pfc = txn.personal_finance_category || {};
     await pool.query(
       `INSERT INTO transactions
@@ -537,16 +547,16 @@ app.get('/api/bills', async (req, res) => {
       // connection date), which silently made this filter find nothing to exclude instead
       // of failing loudly.
       //
-      // rb.last_date >= the connection date matters for the same reason syncOneItem only
-      // keeps transactions from that date forward: Plaid's recurring detector runs against
-      // its own full historical view regardless of when the Item was actually connected, so
-      // without this a bill whose last real occurrence predates the connection - something
-      // Fenn has otherwise decided not to count at all - would still show up here.
+      // rb.last_date's floor matches syncOneItem's DATA_IMPORT_LOOKBACK_DAYS window, not the
+      // bare connection date - Plaid's recurring detector runs against its own full
+      // historical view regardless of when the Item was actually connected, so without a
+      // floor here a bill whose last real occurrence sits outside the window Fenn actually
+      // imported transactions for would still show up, with nothing behind it to link to.
       `SELECT rb.id, rb.merchant_name, rb.description, rb.average_amount, rb.last_amount, rb.frequency, rb.last_date, rb.is_active, rb.user_included
        FROM recurring_bills rb
        JOIN plaid_items pi ON pi.id = rb.plaid_item_id
        WHERE rb.user_id = $1 AND rb.is_active = true AND rb.average_amount > 0
-         AND rb.last_date >= pi.created_at::date
+         AND rb.last_date >= pi.created_at::date - interval '${DATA_IMPORT_LOOKBACK_DAYS} days'
          AND COALESCE(rb.pfc_primary, '') != ALL($2)
          AND COALESCE(rb.pfc_detailed, '') != ALL($3)
        ORDER BY rb.average_amount DESC`,
