@@ -176,6 +176,39 @@ async function requirePaidTier(req, res, next) {
 // If item_id is provided, this instead creates a link_token in "update mode" for that
 // specific existing connection - used to re-authenticate a bank that broke (expired
 // login, MFA change, etc.) rather than creating a brand new connection.
+// Most real banks (Chase, Bank of America, Wells Fargo, etc.) require Plaid Link's OAuth
+// flow, which needs a registered universal-link redirect URI. Sandbox's test institutions
+// don't use OAuth, and passing a redirect_uri that isn't registered for that environment
+// would make linkTokenCreate reject the request outright - so this only applies once
+// PLAID_ENV is actually 'production', leaving Sandbox testing untouched.
+const PLAID_OAUTH_REDIRECT_URI =
+  process.env.PLAID_ENV === 'production' ? 'https://fenn-backend-production.up.railway.app/plaid-oauth' : undefined;
+
+// Proves to iOS that this domain is allowed to hand off to the Fenn app for a given path -
+// required for Plaid's OAuth bank redirect (a plain custom URL scheme isn't accepted for
+// this flow, only a verified universal link) - see PLAID_OAUTH_REDIRECT_URI above.
+app.get('/.well-known/apple-app-site-association', (req, res) => {
+  res.json({
+    applinks: {
+      apps: [],
+      details: [
+        {
+          appID: 'T335XBZWJR.com.fennapp.fenn',
+          appIDs: ['T335XBZWJR.com.fennapp.fenn'],
+          paths: ['/plaid-oauth'],
+        },
+      ],
+    },
+  });
+});
+
+// Where Plaid sends the user back after completing a bank's OAuth login. iOS intercepts
+// this as a universal link and hands off to the app before this ever renders for a user
+// who has Fenn installed - this page is just the fallback for the rare moment it doesn't.
+app.get('/plaid-oauth', (req, res) => {
+  res.send('<p>Redirecting back to Fenn&hellip; you can close this window.</p>');
+});
+
 app.post('/api/create_link_token', requirePaidTier, async (req, res) => {
   try {
     const { item_id } = req.body || {};
@@ -194,6 +227,7 @@ app.post('/api/create_link_token', requirePaidTier, async (req, res) => {
         access_token: decryptToken(item.rows[0].access_token),
         country_codes: ['US'],
         language: 'en',
+        ...(PLAID_OAUTH_REDIRECT_URI && { redirect_uri: PLAID_OAUTH_REDIRECT_URI }),
       });
       return res.json({ link_token: response.data.link_token });
     }
@@ -204,6 +238,7 @@ app.post('/api/create_link_token', requirePaidTier, async (req, res) => {
       products: ['transactions'],
       country_codes: ['US'],
       language: 'en',
+      ...(PLAID_OAUTH_REDIRECT_URI && { redirect_uri: PLAID_OAUTH_REDIRECT_URI }),
     });
     res.json({ link_token: response.data.link_token });
   } catch (err) {
