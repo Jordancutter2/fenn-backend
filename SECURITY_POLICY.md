@@ -98,11 +98,47 @@ is given direct database or server access beyond its own managed platform.
 
 ### Review
 This section follows the same review cadence as the rest of this policy
-(Section 7) and will be revisited as soon as the team grows beyond a single
+(Section 8) and will be revisited as soon as the team grows beyond a single
 person, at which point role-based access control will be introduced for any
 additional personnel.
 
-## 6. Incident response
+## 6. Data retention and deletion policy
+
+*As with the Terms of Service and Privacy Policy, this section is a reasonable
+working policy, not a substitute for review by an actual lawyer regarding
+compliance with a specific jurisdiction's data privacy laws (e.g., CCPA).*
+
+### Retention
+- Account, budget, and transaction data is retained for as long as a user's
+  account remains active, since historical data is a core part of the
+  product itself (spending history, streak calculation, recurring bill
+  detection). There is no separate fixed-duration retention timer beyond
+  that; retention is tied to account lifetime, not a calendar limit.
+- Data collection is minimized at intake rather than only at deletion: on
+  signup, historical transaction backfill from Plaid is capped at 90 days
+  (`DATA_IMPORT_LOOKBACK_DAYS`), rather than importing a user's full
+  available transaction history.
+
+### Deletion
+- Users can delete their account at any time from within the app
+  (Settings), with no grace period and no manual/support intervention
+  required.
+- Deletion is immediate and complete: the backend first calls Plaid's
+  `itemRemove` for each connected bank (revoking Fenn's access to that
+  data at the source, not just locally), then deletes the user's database
+  row. Every other table (transactions, sessions, budgets, manual
+  expenses, recurring bills) references the user row with `ON DELETE
+  CASCADE`, so deletion cascades automatically rather than relying on
+  separate cleanup code that could drift out of sync over time.
+- No soft-delete or retention-after-deletion period exists; there is
+  nothing left to restore once an account is deleted.
+
+### Review
+This policy is reviewed on the same cadence as the rest of this document
+(Section 8), and immediately if data privacy law applicable to Fenn's users
+changes, or if the data collected changes.
+
+## 7. Incident response
 
 In the event of a suspected security incident (e.g., unauthorized access,
 leaked credentials, suspicious database activity):
@@ -118,13 +154,13 @@ leaked credentials, suspicious database activity):
 5. **Review** — document what happened and update this policy or the
    underlying controls to prevent recurrence.
 
-## 7. Review cadence
+## 8. Review cadence
 
 This policy is reviewed at least annually, and immediately after any
 material change to the system's architecture, authentication model, or
 vendor list.
 
-## 8. Contact
+## 9. Contact
 
 Security concerns or suspected vulnerabilities can be reported to
 jordan.cutter@yahoo.com.
