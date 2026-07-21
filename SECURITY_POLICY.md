@@ -51,6 +51,10 @@ revised as the team grows.
 - Crash/error reporting (Sentry) is configured to minimize collected user
   data: default PII collection (IP address) is disabled, and optional
   features that would capture UI content (Session Replay) are not enabled.
+- GitHub Dependabot alerts, security updates, and malware alerts are
+  enabled on both repositories (frontend and backend, both npm-based),
+  providing ongoing automated monitoring for known-vulnerable and known-
+  malicious dependencies, with automatic patch PRs opened for the former.
 
 ### Data minimization and retention
 - Historical transaction backfill on signup is capped (90 days), rather
@@ -176,12 +180,14 @@ known gaps are called out explicitly here rather than left implicit:
   against remote credential-based account takeover. Account-level MFA
   (e.g., email or TOTP-based) is planned as the user base grows beyond the
   initial closed beta.
-- **No formal vulnerability management program yet.** There is no scheduled
-  vulnerability scanning, defined patch SLA, or active EOL-software
-  tracking. Production infrastructure runs on managed platforms (Railway,
-  Neon), which handle OS-level patching themselves as part of their own
-  security programs. Enabling GitHub's built-in Dependabot dependency
-  alerts on both repositories is a planned near-term step.
+- **No formal vulnerability management program beyond dependency scanning.**
+  GitHub Dependabot alerts, security updates, and malware alerts are now
+  enabled on both repositories (see Section 3), giving ongoing automated
+  coverage of known-vulnerable and known-malicious npm dependencies. What's
+  still missing is a defined patch SLA and any scanning beyond the
+  dependency layer; production infrastructure runs on managed platforms
+  (Railway, Neon), which handle OS-level patching themselves as part of
+  their own security programs.
 
 Both gaps are proportionate to Fenn's current stage (pre-launch, single
 founder, no employees) rather than oversights, and will be revisited as
