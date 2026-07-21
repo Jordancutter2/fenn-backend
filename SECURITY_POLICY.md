@@ -77,6 +77,10 @@ is given direct database or server access beyond its own managed platform.
 - Production infrastructure (Railway, Neon, GitHub, and the Plaid Dashboard)
   is accessed solely by the founder; no other personnel currently have
   production access of any kind.
+- Multi-factor authentication is enabled on all four of those accounts
+  (Railway, Neon, GitHub, and the Plaid Dashboard), protecting the systems
+  that hold production credentials and consumer financial data even though
+  the underlying operation is a single person.
 - Access follows the principle of least privilege: the backend application
   is the only entity holding a live database connection and Plaid
   credentials. These are never exposed to, or held by, the frontend client
@@ -160,7 +164,30 @@ This policy is reviewed at least annually, and immediately after any
 material change to the system's architecture, authentication model, or
 vendor list.
 
-## 9. Contact
+## 9. Known limitations and planned improvements
+
+In the interest of this policy being accurate rather than aspirational, two
+known gaps are called out explicitly here rather than left implicit:
+
+- **No consumer-facing multi-factor authentication yet.** Login is
+  single-factor (password, or Sign in with Apple). A device-level Face
+  ID/Touch ID lock is enabled by default on supported hardware, but that
+  protects against someone accessing an already-logged-in device, not
+  against remote credential-based account takeover. Account-level MFA
+  (e.g., email or TOTP-based) is planned as the user base grows beyond the
+  initial closed beta.
+- **No formal vulnerability management program yet.** There is no scheduled
+  vulnerability scanning, defined patch SLA, or active EOL-software
+  tracking. Production infrastructure runs on managed platforms (Railway,
+  Neon), which handle OS-level patching themselves as part of their own
+  security programs. Enabling GitHub's built-in Dependabot dependency
+  alerts on both repositories is a planned near-term step.
+
+Both gaps are proportionate to Fenn's current stage (pre-launch, single
+founder, no employees) rather than oversights, and will be revisited as
+the product and team grow - see Section 8 for review cadence.
+
+## 10. Contact
 
 Security concerns or suspected vulnerabilities can be reported to
 jordan.cutter@yahoo.com.
