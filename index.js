@@ -6,6 +6,7 @@ const plaidClient = require('./plaidClient');
 const pool = require('./db');
 const { encryptToken, decryptToken } = require('./tokenCrypto');
 const { register, login, loginWithApple, logout, requireAuth, changePassword } = require('./auth');
+const { PRIVACY_POLICY, TERMS_OF_SERVICE } = require('./legalContent');
 
 const app = express();
 // Required for express-rate-limit (and req.ip generally) to see the real client IP rather
@@ -28,6 +29,41 @@ app.use(express.static('public'));
 app.use((req, res, next) => {
   console.log(`[request] ${req.method} ${req.originalUrl}`);
   next();
+});
+
+// Publicly hosted versions of the same Terms/Privacy Policy shown in-app before signup -
+// needed as a reviewable link for Plaid's production application, since Fenn has no
+// separate marketing website to host these on.
+function renderLegalDocHtml(doc) {
+  const sections = doc.sections
+    .map((s) => `<section><h2>${s.heading}</h2><p>${s.body}</p></section>`)
+    .join('\n');
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fenn ${doc.title}</title>
+<style>
+  body { font-family: -apple-system, Helvetica, Arial, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; color: #1a1a1a; line-height: 1.6; }
+  h1 { font-size: 24px; }
+  h2 { font-size: 16px; margin-top: 28px; margin-bottom: 6px; }
+  p { font-size: 14px; color: #333; }
+</style>
+</head>
+<body>
+<h1>Fenn ${doc.title}</h1>
+${sections}
+</body>
+</html>`;
+}
+
+app.get('/privacy', (req, res) => {
+  res.send(renderLegalDocHtml(PRIVACY_POLICY));
+});
+
+app.get('/terms', (req, res) => {
+  res.send(renderLegalDocHtml(TERMS_OF_SERVICE));
 });
 
 // Bcrypt's own cost factor already slows down a single guess, but that's not the same as
