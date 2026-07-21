@@ -71,7 +71,38 @@ revised as the team grows.
 Vendor access is limited to what each service needs to function; no vendor
 is given direct database or server access beyond its own managed platform.
 
-## 5. Incident response
+## 5. Access control policy
+
+### Who has access
+- Production infrastructure (Railway, Neon, GitHub, and the Plaid Dashboard)
+  is accessed solely by the founder; no other personnel currently have
+  production access of any kind.
+- Access follows the principle of least privilege: the backend application
+  is the only entity holding a live database connection and Plaid
+  credentials. These are never exposed to, or held by, the frontend client
+  or any third party.
+- Sensitive credentials — the database connection string, the Plaid client
+  secret, and the token-encryption key — are stored exclusively as
+  environment variables on Railway. They are not committed to source
+  control and are not written to application logs.
+
+### Non-human (service-to-service) authentication
+- The backend's connection to its PostgreSQL database (hosted on Neon) is
+  authenticated and encrypted using TLS (`sslmode=require` or stricter); the
+  database will not accept an unencrypted connection.
+- All traffic between the client app and the backend, and between the
+  backend and Plaid's API, is TLS-encrypted (HTTPS only). Railway terminates
+  TLS at its edge, and no unencrypted path to the application exists.
+- The backend authenticates to Plaid's API using a client ID/secret pair
+  transmitted only over this TLS-secured channel, never in plaintext.
+
+### Review
+This section follows the same review cadence as the rest of this policy
+(Section 7) and will be revisited as soon as the team grows beyond a single
+person, at which point role-based access control will be introduced for any
+additional personnel.
+
+## 6. Incident response
 
 In the event of a suspected security incident (e.g., unauthorized access,
 leaked credentials, suspicious database activity):
@@ -87,13 +118,13 @@ leaked credentials, suspicious database activity):
 5. **Review** — document what happened and update this policy or the
    underlying controls to prevent recurrence.
 
-## 6. Review cadence
+## 7. Review cadence
 
 This policy is reviewed at least annually, and immediately after any
 material change to the system's architecture, authentication model, or
 vendor list.
 
-## 7. Contact
+## 8. Contact
 
 Security concerns or suspected vulnerabilities can be reported to
 jordan.cutter@yahoo.com.
