@@ -288,6 +288,19 @@ app.post('/plaid-webhook', async (req, res) => {
       console.error(`[plaid webhook] failed to flag item ${item_id} for reconnect:`, err.message);
     }
   }
+
+  // The mirror case - Plaid can detect a broken login fixed itself without the user ever
+  // going through our update-mode flow (markReconnected, which clears this same flag on
+  // the completion side). Without this, the reconnect banner would keep showing for a
+  // connection that's actually already fine again.
+  if (webhook_type === 'ITEM' && webhook_code === 'LOGIN_REPAIRED' && item_id) {
+    try {
+      await pool.query('UPDATE plaid_items SET needs_reconnect = false WHERE plaid_item_id = $1', [item_id]);
+      console.log(`[plaid webhook] cleared reconnect flag for item ${item_id} (LOGIN_REPAIRED)`);
+    } catch (err) {
+      console.error(`[plaid webhook] failed to clear reconnect flag for item ${item_id}:`, err.message);
+    }
+  }
 });
 
 // Proves to iOS that this domain is allowed to hand off to the Fenn app for a given path -
