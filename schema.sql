@@ -172,3 +172,16 @@ CREATE TABLE IF NOT EXISTS manual_expenses (
 ALTER TABLE manual_expenses ADD COLUMN IF NOT EXISTS local_date DATE;
 
 CREATE INDEX IF NOT EXISTS idx_manual_expenses_user_local_date ON manual_expenses(user_id, local_date);
+
+-- Every webhook Plaid ever sends us, regardless of type - an audit trail more than an
+-- operational table today, since nothing acts on specific webhook codes yet beyond logging
+-- them. item_id is Plaid's own identifier, not our internal plaid_items.id - deliberately
+-- not a foreign key, since a webhook can arrive for an item we've already deleted our side.
+CREATE TABLE IF NOT EXISTS webhook_log (
+  id SERIAL PRIMARY KEY,
+  received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  webhook_type TEXT,
+  webhook_code TEXT,
+  item_id TEXT,
+  payload JSONB
+);

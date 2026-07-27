@@ -220,6 +220,28 @@ async function requirePaidTier(req, res, next) {
 const PLAID_OAUTH_REDIRECT_URI =
   process.env.PLAID_ENV === 'production' ? 'https://fenn-backend-production.up.railway.app/plaid-oauth' : undefined;
 
+// Unlike the OAuth redirect_uri, a webhook URL doesn't need to be pre-registered anywhere -
+// safe to send in both Sandbox and Production.
+const PLAID_WEBHOOK_URL = 'https://fenn-backend-production.up.railway.app/plaid-webhook';
+
+// Where Plaid sends server-to-server notifications (new transactions ready, an Item
+// breaking, etc.). Nothing acts on specific webhook codes yet beyond logging every one to
+// webhook_log - this is the receiver existing and proven reachable, not full handling of
+// each event type. Public (no requireAuth): Plaid calls this directly, with no user session.
+app.post('/plaid-webhook', async (req, res) => {
+  const { webhook_type, webhook_code, item_id } = req.body || {};
+  console.log(`[plaid webhook] ${webhook_type}/${webhook_code} for item ${item_id}`);
+  try {
+    await pool.query(
+      'INSERT INTO webhook_log (webhook_type, webhook_code, item_id, payload) VALUES ($1, $2, $3, $4)',
+      [webhook_type, webhook_code, item_id, JSON.stringify(req.body)]
+    );
+  } catch (err) {
+    console.error('Failed to log webhook', err);
+  }
+  res.sendStatus(200);
+});
+
 // Proves to iOS that this domain is allowed to hand off to the Fenn app for a given path -
 // required for Plaid's OAuth bank redirect (a plain custom URL scheme isn't accepted for
 // this flow, only a verified universal link) - see PLAID_OAUTH_REDIRECT_URI above.
@@ -263,6 +285,7 @@ app.post('/api/create_link_token', requirePaidTier, async (req, res) => {
         access_token: decryptToken(item.rows[0].access_token),
         country_codes: ['US'],
         language: 'en',
+        webhook: PLAID_WEBHOOK_URL,
         ...(PLAID_OAUTH_REDIRECT_URI && { redirect_uri: PLAID_OAUTH_REDIRECT_URI }),
       });
       return res.json({ link_token: response.data.link_token });
@@ -274,6 +297,7 @@ app.post('/api/create_link_token', requirePaidTier, async (req, res) => {
       products: ['transactions'],
       country_codes: ['US'],
       language: 'en',
+      webhook: PLAID_WEBHOOK_URL,
       ...(PLAID_OAUTH_REDIRECT_URI && { redirect_uri: PLAID_OAUTH_REDIRECT_URI }),
     });
     res.json({ link_token: response.data.link_token });
