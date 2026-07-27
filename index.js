@@ -243,6 +243,12 @@ const TRANSACTIONS_UPDATE_CODES = new Set([
   'HISTORICAL_UPDATE',
 ]);
 
+// Plaid can fire several of the above for the same underlying update within seconds of
+// each other (observed directly: INITIAL_UPDATE, SYNC_UPDATES_AVAILABLE, and
+// HISTORICAL_UPDATE all within 3 seconds of one bank linking) - skip a resync that just
+// happened rather than repeat the same live Plaid call and insert loop for nothing new.
+const TRANSACTIONS_SYNC_DEBOUNCE_MS = 10_000;
+
 // Where Plaid sends server-to-server notifications (new transactions ready, an Item
 // breaking, etc.). Every webhook is logged to webhook_log regardless of type; transaction-
 // update codes additionally trigger a real resync of that Item. Public (no requireAuth):
@@ -271,16 +277,21 @@ app.post('/plaid-webhook', async (req, res) => {
   if (webhook_type === 'TRANSACTIONS' && TRANSACTIONS_UPDATE_CODES.has(webhook_code) && item_id) {
     try {
       const result = await pool.query(
-        'SELECT id, user_id, access_token, cursor, created_at FROM plaid_items WHERE plaid_item_id = $1',
+        'SELECT id, user_id, access_token, cursor, created_at, last_synced_at FROM plaid_items WHERE plaid_item_id = $1',
         [item_id]
       );
       const item = result.rows[0];
-      if (item) {
+      const msSinceLastSync = item?.last_synced_at ? Date.now() - new Date(item.last_synced_at).getTime() : Infinity;
+
+      if (!item) {
+        if (webhookLogId) await pool.query('UPDATE webhook_log SET sync_error = $1 WHERE id = $2', ['NO_MATCHING_ITEM', webhookLogId]);
+      } else if (msSinceLastSync < TRANSACTIONS_SYNC_DEBOUNCE_MS) {
+        console.log(`[plaid webhook] skipping sync for item ${item_id} - synced ${msSinceLastSync}ms ago`);
+        if (webhookLogId) await pool.query('UPDATE webhook_log SET sync_error = $1 WHERE id = $2', ['SKIPPED_DEBOUNCE', webhookLogId]);
+      } else {
         await syncOneItem(item, item.user_id);
         console.log(`[plaid webhook] synced item ${item_id} after ${webhook_code}`);
         if (webhookLogId) await pool.query('UPDATE webhook_log SET sync_error = $1 WHERE id = $2', ['OK', webhookLogId]);
-      } else if (webhookLogId) {
-        await pool.query('UPDATE webhook_log SET sync_error = $1 WHERE id = $2', ['NO_MATCHING_ITEM', webhookLogId]);
       }
     } catch (err) {
       const message = err.response?.data ? JSON.stringify(err.response.data) : err.message;
@@ -546,7 +557,7 @@ async function syncOneItem(item, userId) {
     await pool.query('DELETE FROM transactions WHERE plaid_transaction_id = ANY($1)', [removedIds]);
   }
 
-  await pool.query('UPDATE plaid_items SET cursor = $1 WHERE id = $2', [cursor, item.id]);
+  await pool.query('UPDATE plaid_items SET cursor = $1, last_synced_at = now() WHERE id = $2', [cursor, item.id]);
 
   return { added: added.length, modified: modified.length, removed: removed.length };
 }

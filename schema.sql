@@ -59,6 +59,11 @@ ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS needs_reconnect BOOLEAN NOT NUL
 -- login) since this means the connection is fine, but Plaid has spotted an account at that
 -- same institution the user hasn't shared with us yet.
 ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS new_accounts_available BOOLEAN NOT NULL DEFAULT false;
+-- Lets the webhook handler skip a redundant /transactions/sync call when Plaid fires
+-- several webhook codes for the same underlying update in quick succession (observed:
+-- INITIAL_UPDATE, SYNC_UPDATES_AVAILABLE, and HISTORICAL_UPDATE all within a few seconds
+-- of one bank linking).
+ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ;
 
 -- Cached copy of transactions pulled from Plaid via /transactions/sync.
 CREATE TABLE IF NOT EXISTS transactions (
