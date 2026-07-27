@@ -151,6 +151,22 @@ is given direct database or server access beyond its own managed platform.
   independent credentials per platform, centralizing authentication to
   that one identity rather than fragmenting it across systems.
 
+### Periodic access reviews and audits
+Every quarter, the founder reviews access to every system holding production
+credentials or consumer data (Railway, Neon, GitHub, the Plaid Dashboard):
+- Confirm no additional collaborators, team members, or API keys have been
+  added beyond what this policy documents.
+- Confirm multi-factor authentication is still enabled on all four accounts.
+- Review and revoke any unused API keys, access tokens, OAuth grants, or
+  webhooks that are no longer needed.
+- Confirm the vendor list in Section 4 still matches what's actually
+  integrated - no forgotten or abandoned third-party access.
+
+**Most recent review: 2026-07-27.** Findings: no collaborators beyond the
+founder on any of the four systems; MFA confirmed still enabled on all
+four; no unused API keys, tokens, or webhooks identified for revocation.
+Next review due by 2026-10-27.
+
 ### Review
 This section follows the same review cadence as the rest of this policy
 (Section 8) and will be revisited as the team grows beyond a single
@@ -235,13 +251,10 @@ are called out explicitly here rather than left implicit:
   perform an action - and none has been built, since it has never been
   needed. This will be built once Fenn actually has personnel for it to
   apply to, not before.
-- **No formal periodic access review cadence yet**, beyond this policy's
-  own annual review (Section 8). The founder's own access to production
-  systems is not currently reviewed on a schedule independent of that.
 
-The gaps above are proportionate to Fenn's current stage (pre-launch, single
-founder, no employees) rather than oversights, and will be revisited as
-the product and team grow.
+Both gaps above are proportionate to Fenn's current stage (pre-launch,
+single founder, no employees) rather than oversights, and will be
+revisited as the product and team grow.
 
 ## 10. Contact
 
