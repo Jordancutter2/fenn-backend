@@ -187,7 +187,7 @@ app.delete('/api/account', requireAuth, async (req, res) => {
       try {
         await plaidClient.itemRemove({ access_token: decryptToken(item.access_token) });
       } catch (err) {
-        console.error(err.response ? err.response.data : err);
+        console.error(`itemRemove failed for item ${item.plaid_item_id}:`, err.response ? err.response.data : err);
       }
     }
     if (items.rows.length > 0) {
@@ -447,7 +447,7 @@ app.delete('/api/plaid_items/:id', async (req, res) => {
     try {
       await plaidClient.itemRemove({ access_token: decryptToken(item.rows[0].access_token) });
     } catch (err) {
-      console.error(err.response ? err.response.data : err);
+      console.error(`itemRemove failed for item ${item.rows[0].plaid_item_id}:`, err.response ? err.response.data : err);
     }
 
     await pool.query('DELETE FROM webhook_log WHERE item_id = $1', [item.rows[0].plaid_item_id]);
@@ -609,7 +609,7 @@ app.post('/api/sync_transactions', async (req, res) => {
           await pool.query('UPDATE plaid_items SET needs_reconnect = true WHERE id = $1', [item.id]);
           needsReconnect.push(item.id);
         } else {
-          console.error(err.response ? err.response.data : err);
+          console.error(`sync failed for item ${item.plaid_item_id}:`, err.response ? err.response.data : err);
         }
       }
     }
@@ -703,62 +703,70 @@ app.get('/api/plaid_items', async (req, res) => {
 app.post('/api/sync_recurring', async (req, res) => {
   try {
     const userId = req.userId;
-    const items = await pool.query('SELECT id, access_token FROM plaid_items WHERE user_id = $1', [userId]);
+    const items = await pool.query('SELECT id, plaid_item_id, access_token FROM plaid_items WHERE user_id = $1', [
+      userId,
+    ]);
 
     for (const item of items.rows) {
-      const response = await plaidClient.transactionsRecurringGet({ access_token: decryptToken(item.access_token) });
+      // Same per-item isolation as sync_transactions - one bad connection shouldn't block
+      // recurring-bill detection for the rest of a user's banks.
+      try {
+        const response = await plaidClient.transactionsRecurringGet({ access_token: decryptToken(item.access_token) });
 
-      for (const stream of response.data.outflow_streams) {
-        // Belt-and-suspenders: outflow_streams should already exclude income/refunds
-        // (those land in inflow_streams, which we never fetch), but never store a
-        // stream that isn't a genuine positive-amount recurring expense.
-        if (!(stream.average_amount?.amount > 0)) continue;
+        for (const stream of response.data.outflow_streams) {
+          // Belt-and-suspenders: outflow_streams should already exclude income/refunds
+          // (those land in inflow_streams, which we never fetch), but never store a
+          // stream that isn't a genuine positive-amount recurring expense.
+          if (!(stream.average_amount?.amount > 0)) continue;
 
-        const billResult = await pool.query(
-          `INSERT INTO recurring_bills
-             (user_id, plaid_item_id, stream_id, merchant_name, description, average_amount, last_amount, frequency, last_date, is_active, pfc_primary, pfc_detailed, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
-           ON CONFLICT (stream_id) DO UPDATE SET
-             merchant_name = EXCLUDED.merchant_name,
-             average_amount = EXCLUDED.average_amount,
-             last_amount = EXCLUDED.last_amount,
-             frequency = EXCLUDED.frequency,
-             last_date = EXCLUDED.last_date,
-             is_active = EXCLUDED.is_active,
-             pfc_primary = EXCLUDED.pfc_primary,
-             pfc_detailed = EXCLUDED.pfc_detailed,
-             updated_at = now()
-           RETURNING id, user_included`,
-          [
-            userId,
-            item.id,
-            stream.stream_id,
-            stream.merchant_name,
-            stream.description,
-            stream.average_amount?.amount ?? null,
-            stream.last_amount?.amount ?? null,
-            stream.frequency,
-            stream.last_date,
-            stream.is_active,
-            stream.personal_finance_category?.primary ?? null,
-            stream.personal_finance_category?.detailed ?? null,
-          ]
-        );
-
-        if (stream.transaction_ids.length > 0) {
-          // A newly-linked transaction inherits the bill's include/exclude choice only if
-          // it doesn't already have its own individual override (user_excluded IS NULL) -
-          // this is what makes toggling a bill apply to future occurrences automatically,
-          // without silently clobbering a one-off exception someone already set on a
-          // specific past occurrence.
-          await pool.query(
-            `UPDATE transactions
-             SET is_recurring_bill = true, recurring_bill_id = $2,
-                 user_excluded = CASE WHEN user_excluded IS NULL AND $3 THEN false ELSE user_excluded END
-             WHERE plaid_transaction_id = ANY($1)`,
-            [stream.transaction_ids, billResult.rows[0].id, billResult.rows[0].user_included]
+          const billResult = await pool.query(
+            `INSERT INTO recurring_bills
+               (user_id, plaid_item_id, stream_id, merchant_name, description, average_amount, last_amount, frequency, last_date, is_active, pfc_primary, pfc_detailed, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+             ON CONFLICT (stream_id) DO UPDATE SET
+               merchant_name = EXCLUDED.merchant_name,
+               average_amount = EXCLUDED.average_amount,
+               last_amount = EXCLUDED.last_amount,
+               frequency = EXCLUDED.frequency,
+               last_date = EXCLUDED.last_date,
+               is_active = EXCLUDED.is_active,
+               pfc_primary = EXCLUDED.pfc_primary,
+               pfc_detailed = EXCLUDED.pfc_detailed,
+               updated_at = now()
+             RETURNING id, user_included`,
+            [
+              userId,
+              item.id,
+              stream.stream_id,
+              stream.merchant_name,
+              stream.description,
+              stream.average_amount?.amount ?? null,
+              stream.last_amount?.amount ?? null,
+              stream.frequency,
+              stream.last_date,
+              stream.is_active,
+              stream.personal_finance_category?.primary ?? null,
+              stream.personal_finance_category?.detailed ?? null,
+            ]
           );
+
+          if (stream.transaction_ids.length > 0) {
+            // A newly-linked transaction inherits the bill's include/exclude choice only if
+            // it doesn't already have its own individual override (user_excluded IS NULL) -
+            // this is what makes toggling a bill apply to future occurrences automatically,
+            // without silently clobbering a one-off exception someone already set on a
+            // specific past occurrence.
+            await pool.query(
+              `UPDATE transactions
+               SET is_recurring_bill = true, recurring_bill_id = $2,
+                   user_excluded = CASE WHEN user_excluded IS NULL AND $3 THEN false ELSE user_excluded END
+               WHERE plaid_transaction_id = ANY($1)`,
+              [stream.transaction_ids, billResult.rows[0].id, billResult.rows[0].user_included]
+            );
+          }
         }
+      } catch (err) {
+        console.error(`sync_recurring failed for item ${item.plaid_item_id}:`, err.response ? err.response.data : err);
       }
     }
 
