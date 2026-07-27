@@ -271,6 +271,23 @@ app.post('/plaid-webhook', async (req, res) => {
       console.error(`[plaid webhook] sync failed for item ${item_id}:`, err.response?.data || err.message);
     }
   }
+
+  // Same needs_reconnect flag already set reactively when a foreground sync hits
+  // ITEM_LOGIN_REQUIRED (see syncOneItem's caller) - this sets it proactively too, from
+  // Plaid telling us in advance rather than waiting for the user to open the app and a
+  // sync to fail. The existing reconnect entry point (LinkedBanks.js's update-mode Link
+  // flow) is what actually resolves it - nothing new needed on that side.
+  const isLoginRequiredError = webhook_type === 'ITEM' && webhook_code === 'ERROR' && req.body?.error?.error_code === 'ITEM_LOGIN_REQUIRED';
+  const isPendingExpirationOrDisconnect =
+    webhook_type === 'ITEM' && (webhook_code === 'PENDING_EXPIRATION' || webhook_code === 'PENDING_DISCONNECT');
+  if ((isLoginRequiredError || isPendingExpirationOrDisconnect) && item_id) {
+    try {
+      await pool.query('UPDATE plaid_items SET needs_reconnect = true WHERE plaid_item_id = $1', [item_id]);
+      console.log(`[plaid webhook] flagged item ${item_id} for reconnect (${webhook_code})`);
+    } catch (err) {
+      console.error(`[plaid webhook] failed to flag item ${item_id} for reconnect:`, err.message);
+    }
+  }
 });
 
 // Proves to iOS that this domain is allowed to hand off to the Fenn app for a given path -
