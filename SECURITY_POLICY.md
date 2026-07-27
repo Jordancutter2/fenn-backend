@@ -1,6 +1,6 @@
 # Fenn Information Security Policy
 
-**Last reviewed:** 2026-07-21
+**Last reviewed:** 2026-07-27
 **Owner:** Jordan Cutter (founder/sole operator)
 
 ## 1. Purpose and scope
@@ -51,10 +51,34 @@ revised as the team grows.
 - Crash/error reporting (Sentry) is configured to minimize collected user
   data: default PII collection (IP address) is disabled, and optional
   features that would capture UI content (Session Replay) are not enabled.
-- GitHub Dependabot alerts, security updates, and malware alerts are
-  enabled on both repositories (frontend and backend, both npm-based),
-  providing ongoing automated monitoring for known-vulnerable and known-
-  malicious dependencies, with automatic patch PRs opened for the former.
+
+### Vulnerability management and patch SLA
+- GitHub Dependabot alerts, security updates, and malware alerts are enabled
+  on both repositories (frontend and backend, both npm-based), providing
+  ongoing automated monitoring for known-vulnerable and known-malicious
+  dependencies, with automatic patch PRs opened for the former.
+- Defined patch SLA, measured from when a vulnerability is flagged (by
+  Dependabot or any other source):
+  - **Critical** (actively exploited, or directly affecting production data
+    security): patched within 7 days.
+  - **High**: patched within 30 days.
+  - **Moderate or low**: patched within 90 days, or at the next routine
+    dependency update if sooner.
+- Production infrastructure (Railway, Neon) is managed-platform hosting;
+  OS-level and infrastructure patching is handled by those providers as part
+  of their own security programs, not by Fenn directly.
+
+### End-of-life (EOL) software monitoring
+- Application dependencies are continuously monitored via GitHub Dependabot,
+  which flags packages with known vulnerabilities regardless of EOL status.
+- Runtime versions (Node.js, PostgreSQL) are managed by Railway and Neon
+  respectively as part of their own infrastructure lifecycle - neither is
+  self-hosted by Fenn.
+- The app's own pinned runtime and major dependency versions (e.g., the
+  Node.js version used locally and in CI, the Expo/React Native SDK version)
+  are reviewed against public EOL schedules at least as often as this
+  policy's own review cadence (Section 8), and upgraded proactively rather
+  than waiting for a forced deprecation.
 
 ### Data minimization and retention
 - Historical transaction backfill on signup is capped (90 days), rather
@@ -170,8 +194,8 @@ vendor list.
 
 ## 9. Known limitations and planned improvements
 
-In the interest of this policy being accurate rather than aspirational, two
-known gaps are called out explicitly here rather than left implicit:
+In the interest of this policy being accurate rather than aspirational, gaps
+are called out explicitly here rather than left implicit:
 
 - **No consumer-facing multi-factor authentication yet.** Login is
   single-factor (password, or Sign in with Apple). A device-level Face
@@ -180,18 +204,18 @@ known gaps are called out explicitly here rather than left implicit:
   against remote credential-based account takeover. Account-level MFA
   (e.g., email or TOTP-based) is planned as the user base grows beyond the
   initial closed beta.
-- **No formal vulnerability management program beyond dependency scanning.**
-  GitHub Dependabot alerts, security updates, and malware alerts are now
-  enabled on both repositories (see Section 3), giving ongoing automated
-  coverage of known-vulnerable and known-malicious npm dependencies. What's
-  still missing is a defined patch SLA and any scanning beyond the
-  dependency layer; production infrastructure runs on managed platforms
-  (Railway, Neon), which handle OS-level patching themselves as part of
-  their own security programs.
+- **No role-based access control, centralized identity and access
+  management, zero trust architecture, periodic access reviews/audits, or
+  automated employee de-provisioning.** These are deliberately not
+  implemented: Fenn is operated by a single founder with no other personnel,
+  and each of these controls exists to govern access and reviews across a
+  team. Building them now would be process with nothing to apply it to, not
+  a real security improvement. They will be introduced if and when Fenn
+  brings on additional people - see Section 8 for review cadence.
 
-Both gaps are proportionate to Fenn's current stage (pre-launch, single
+The gaps above are proportionate to Fenn's current stage (pre-launch, single
 founder, no employees) rather than oversights, and will be revisited as
-the product and team grow - see Section 8 for review cadence.
+the product and team grow.
 
 ## 10. Contact
 
