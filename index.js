@@ -247,6 +247,13 @@ const TRANSACTIONS_UPDATE_CODES = new Set([
 // breaking, etc.). Every webhook is logged to webhook_log regardless of type; transaction-
 // update codes additionally trigger a real resync of that Item. Public (no requireAuth):
 // Plaid calls this directly, with no user session.
+// Everything here runs BEFORE responding to Plaid, not after - Railway doesn't guarantee
+// background work continues once a request's HTTP response has been sent, which silently
+// dropped the Transactions resync in production (confirmed: it ran correctly every time
+// locally, and the much cheaper single-row needs_reconnect update after it in the same
+// handler kept succeeding in production even when the resync didn't - work started after
+// res.sendStatus() just wasn't reliably finishing). Plaid tolerates several seconds before
+// treating a webhook as failed, so doing the work synchronously here is well within that.
 app.post('/plaid-webhook', async (req, res) => {
   const { webhook_type, webhook_code, item_id } = req.body || {};
   console.log(`[plaid webhook] ${webhook_type}/${webhook_code} for item ${item_id}`);
@@ -260,10 +267,6 @@ app.post('/plaid-webhook', async (req, res) => {
   } catch (err) {
     console.error('Failed to log webhook', err);
   }
-
-  // Acknowledge Plaid immediately - the sync itself runs after responding rather than
-  // blocking it, since Plaid expects a fast response and may retry on timeout.
-  res.sendStatus(200);
 
   if (webhook_type === 'TRANSACTIONS' && TRANSACTIONS_UPDATE_CODES.has(webhook_code) && item_id) {
     try {
@@ -327,6 +330,8 @@ app.post('/plaid-webhook', async (req, res) => {
       console.error(`[plaid webhook] failed to flag item ${item_id} for new accounts:`, err.message);
     }
   }
+
+  res.sendStatus(200);
 });
 
 // Proves to iOS that this domain is allowed to hand off to the Fenn app for a given path -
