@@ -463,15 +463,29 @@ app.delete('/api/plaid_items/:id', async (req, res) => {
 // We exchange it for a long-lived access_token and save it against the user's row.
 app.post('/api/exchange_public_token', requirePaidTier, async (req, res) => {
   try {
-    const { public_token, institution_name } = req.body;
-    const response = await plaidClient.itemPublicTokenExchange({ public_token });
+    const { public_token, institution_name, institution_id } = req.body;
     const userId = req.userId;
 
+    // Per Plaid's own duplicate-Item guidance: check before exchanging, not after - an
+    // exchanged-then-discarded Item still counts as a connection for billing purposes.
+    // institution_id (not the display name) is the reliable match key here.
+    if (institution_id) {
+      const existing = await pool.query(
+        'SELECT id FROM plaid_items WHERE user_id = $1 AND institution_id = $2',
+        [userId, institution_id]
+      );
+      if (existing.rows.length > 0) {
+        return res.status(409).json({ error: 'You already have this bank connected.' });
+      }
+    }
+
+    const response = await plaidClient.itemPublicTokenExchange({ public_token });
+
     await pool.query(
-      `INSERT INTO plaid_items (user_id, plaid_item_id, access_token, institution_name)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO plaid_items (user_id, plaid_item_id, access_token, institution_name, institution_id)
+       VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (plaid_item_id) DO UPDATE SET access_token = EXCLUDED.access_token`,
-      [userId, response.data.item_id, encryptToken(response.data.access_token), institution_name || null]
+      [userId, response.data.item_id, encryptToken(response.data.access_token), institution_name || null, institution_id || null]
     );
 
     res.json({ item_id: response.data.item_id });

@@ -64,6 +64,10 @@ ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS new_accounts_available BOOLEAN 
 -- INITIAL_UPDATE, SYNC_UPDATES_AVAILABLE, and HISTORICAL_UPDATE all within a few seconds
 -- of one bank linking).
 ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ;
+-- Plaid's own institution identifier (e.g. 'ins_109508') - distinct from institution_name,
+-- which is just a display string. Used to detect a user re-linking a bank they already
+-- have connected, per Plaid's own duplicate-Item prevention guidance.
+ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS institution_id TEXT;
 
 -- Cached copy of transactions pulled from Plaid via /transactions/sync.
 CREATE TABLE IF NOT EXISTS transactions (
