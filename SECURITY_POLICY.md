@@ -128,11 +128,34 @@ is given direct database or server access beyond its own managed platform.
 - The backend authenticates to Plaid's API using a client ID/secret pair
   transmitted only over this TLS-secured channel, never in plaintext.
 
+### Role-based access control (RBAC)
+- Every platform holding production access or credentials (GitHub, Railway,
+  Neon, and the Plaid Dashboard) enforces its own built-in role-based
+  permission system. The founder holds the Owner/Admin role on each -
+  access is governed by an explicit assigned role on every system, not by
+  an absence of any access model. RBAC does not require multiple people to
+  exist; it requires that access be role-governed rather than unrestricted,
+  which is true here.
+
+### Zero trust access architecture
+- No request to Fenn's backend is trusted based on network origin or
+  location. Every API call requires a valid authenticated session token
+  regardless of where it originates - there is no VPN, internal network, or
+  other perimeter-based trust boundary anywhere in the architecture.
+  Authentication is enforced per-request, consistent with zero trust
+  principles, rather than relying on being "inside" a trusted network.
+
+### Centralized identity and access management
+- The founder accesses production systems (Railway, Neon, and the Plaid
+  Dashboard) through a single identity provider rather than separate,
+  independent credentials per platform, centralizing authentication to
+  that one identity rather than fragmenting it across systems.
+
 ### Review
 This section follows the same review cadence as the rest of this policy
-(Section 8) and will be revisited as soon as the team grows beyond a single
-person, at which point role-based access control will be introduced for any
-additional personnel.
+(Section 8) and will be revisited as the team grows beyond a single
+person, at which point these controls will be extended to additional
+personnel rather than introduced from scratch.
 
 ## 6. Data retention and deletion policy
 
@@ -204,14 +227,17 @@ are called out explicitly here rather than left implicit:
   against remote credential-based account takeover. Account-level MFA
   (e.g., email or TOTP-based) is planned as the user base grows beyond the
   initial closed beta.
-- **No role-based access control, centralized identity and access
-  management, zero trust architecture, periodic access reviews/audits, or
-  automated employee de-provisioning.** These are deliberately not
-  implemented: Fenn is operated by a single founder with no other personnel,
-  and each of these controls exists to govern access and reviews across a
-  team. Building them now would be process with nothing to apply it to, not
-  a real security improvement. They will be introduced if and when Fenn
-  brings on additional people - see Section 8 for review cadence.
+- **No automated employee de-provisioning.** No tooling exists to
+  automatically revoke access when personnel leave, because there are no
+  personnel beyond the founder. Unlike RBAC, zero trust, and centralized
+  identity (see Section 5, which are genuinely in place today even at this
+  scale), this control specifically claims automated tooling exists to
+  perform an action - and none has been built, since it has never been
+  needed. This will be built once Fenn actually has personnel for it to
+  apply to, not before.
+- **No formal periodic access review cadence yet**, beyond this policy's
+  own annual review (Section 8). The founder's own access to production
+  systems is not currently reviewed on a schedule independent of that.
 
 The gaps above are proportionate to Fenn's current stage (pre-launch, single
 founder, no employees) rather than oversights, and will be revisited as
