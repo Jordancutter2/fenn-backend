@@ -308,6 +308,18 @@ app.post('/plaid-webhook', async (req, res) => {
       console.error(`[plaid webhook] failed to clear reconnect flag for item ${item_id}:`, err.message);
     }
   }
+
+  // The connection itself is fine here (unlike needs_reconnect) - Plaid's just spotted an
+  // account at that institution the user hasn't shared with us. create_link_token reads
+  // this flag to decide whether to request account_selection_enabled for that item.
+  if (webhook_type === 'ITEM' && webhook_code === 'NEW_ACCOUNTS_AVAILABLE' && item_id) {
+    try {
+      await pool.query('UPDATE plaid_items SET new_accounts_available = true WHERE plaid_item_id = $1', [item_id]);
+      console.log(`[plaid webhook] flagged item ${item_id} - new accounts available`);
+    } catch (err) {
+      console.error(`[plaid webhook] failed to flag item ${item_id} for new accounts:`, err.message);
+    }
+  }
 });
 
 // Proves to iOS that this domain is allowed to hand off to the Fenn app for a given path -
@@ -340,10 +352,10 @@ app.post('/api/create_link_token', requirePaidTier, async (req, res) => {
     const { item_id } = req.body || {};
 
     if (item_id) {
-      const item = await pool.query('SELECT access_token FROM plaid_items WHERE id = $1 AND user_id = $2', [
-        item_id,
-        req.userId,
-      ]);
+      const item = await pool.query(
+        'SELECT access_token, new_accounts_available FROM plaid_items WHERE id = $1 AND user_id = $2',
+        [item_id, req.userId]
+      );
       if (item.rows.length === 0) {
         return res.status(404).json({ error: 'Bank connection not found' });
       }
@@ -355,6 +367,9 @@ app.post('/api/create_link_token', requirePaidTier, async (req, res) => {
         language: 'en',
         webhook: PLAID_WEBHOOK_URL,
         ...(PLAID_OAUTH_REDIRECT_URI && { redirect_uri: PLAID_OAUTH_REDIRECT_URI }),
+        // Only requested when Plaid's actually told us new accounts are sitting there
+        // (NEW_ACCOUNTS_AVAILABLE) - a plain broken-login reconnect doesn't need this.
+        ...(item.rows[0].new_accounts_available && { update: { account_selection_enabled: true } }),
       });
       return res.json({ link_token: response.data.link_token });
     }
@@ -379,10 +394,10 @@ app.post('/api/create_link_token', requirePaidTier, async (req, res) => {
 // we just clear the flag so the reconnect banner goes away.
 app.post('/api/plaid_items/:id/reconnected', async (req, res) => {
   try {
-    await pool.query('UPDATE plaid_items SET needs_reconnect = false WHERE id = $1 AND user_id = $2', [
-      req.params.id,
-      req.userId,
-    ]);
+    await pool.query(
+      'UPDATE plaid_items SET needs_reconnect = false, new_accounts_available = false WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.userId]
+    );
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -633,7 +648,7 @@ app.get('/api/plaid_items', async (req, res) => {
   try {
     const userId = req.userId;
     const result = await pool.query(
-      'SELECT id, institution_name, needs_reconnect, created_at FROM plaid_items WHERE user_id = $1 ORDER BY created_at',
+      'SELECT id, institution_name, needs_reconnect, new_accounts_available, created_at FROM plaid_items WHERE user_id = $1 ORDER BY created_at',
       [userId]
     );
     res.json(result.rows);

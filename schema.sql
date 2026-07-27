@@ -55,6 +55,10 @@ CREATE TABLE IF NOT EXISTS plaid_items (
 );
 
 ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS needs_reconnect BOOLEAN NOT NULL DEFAULT false;
+-- Set from the NEW_ACCOUNTS_AVAILABLE webhook - distinct from needs_reconnect (a broken
+-- login) since this means the connection is fine, but Plaid has spotted an account at that
+-- same institution the user hasn't shared with us yet.
+ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS new_accounts_available BOOLEAN NOT NULL DEFAULT false;
 
 -- Cached copy of transactions pulled from Plaid via /transactions/sync.
 CREATE TABLE IF NOT EXISTS transactions (
