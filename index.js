@@ -243,11 +243,13 @@ const TRANSACTIONS_UPDATE_CODES = new Set([
 app.post('/plaid-webhook', async (req, res) => {
   const { webhook_type, webhook_code, item_id } = req.body || {};
   console.log(`[plaid webhook] ${webhook_type}/${webhook_code} for item ${item_id}`);
+  let webhookLogId = null;
   try {
-    await pool.query(
-      'INSERT INTO webhook_log (webhook_type, webhook_code, item_id, payload) VALUES ($1, $2, $3, $4)',
+    const inserted = await pool.query(
+      'INSERT INTO webhook_log (webhook_type, webhook_code, item_id, payload) VALUES ($1, $2, $3, $4) RETURNING id',
       [webhook_type, webhook_code, item_id, JSON.stringify(req.body)]
     );
+    webhookLogId = inserted.rows[0].id;
   } catch (err) {
     console.error('Failed to log webhook', err);
   }
@@ -266,9 +268,14 @@ app.post('/plaid-webhook', async (req, res) => {
       if (item) {
         await syncOneItem(item, item.user_id);
         console.log(`[plaid webhook] synced item ${item_id} after ${webhook_code}`);
+        if (webhookLogId) await pool.query('UPDATE webhook_log SET sync_error = $1 WHERE id = $2', ['OK', webhookLogId]);
+      } else if (webhookLogId) {
+        await pool.query('UPDATE webhook_log SET sync_error = $1 WHERE id = $2', ['NO_MATCHING_ITEM', webhookLogId]);
       }
     } catch (err) {
-      console.error(`[plaid webhook] sync failed for item ${item_id}:`, err.response?.data || err.message);
+      const message = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+      console.error(`[plaid webhook] sync failed for item ${item_id}:`, message);
+      if (webhookLogId) await pool.query('UPDATE webhook_log SET sync_error = $1 WHERE id = $2', [message, webhookLogId]);
     }
   }
 

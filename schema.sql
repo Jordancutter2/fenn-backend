@@ -185,3 +185,8 @@ CREATE TABLE IF NOT EXISTS webhook_log (
   item_id TEXT,
   payload JSONB
 );
+
+-- Result of acting on a transaction-update webhook (see /plaid-webhook): 'OK', an error
+-- message, or 'NO_MATCHING_ITEM' if the webhook's item_id didn't match anything in
+-- plaid_items. Not filled in for webhook types/codes that don't trigger a sync at all.
+ALTER TABLE webhook_log ADD COLUMN IF NOT EXISTS sync_error TEXT;
