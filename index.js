@@ -224,10 +224,22 @@ const PLAID_OAUTH_REDIRECT_URI =
 // safe to send in both Sandbox and Production.
 const PLAID_WEBHOOK_URL = 'https://fenn-backend-production.up.railway.app/plaid-webhook';
 
+// New data ready for an Item - the Transactions "core workflow" Plaid documents means
+// responding to these by actually calling /transactions/sync, not just logging them.
+// SYNC_UPDATES_AVAILABLE is the modern code for /sync-based integrations; the others are
+// the older lifecycle codes Plaid can still send for the same underlying event - handling
+// all of them covers either case rather than guessing which one production will use.
+const TRANSACTIONS_UPDATE_CODES = new Set([
+  'SYNC_UPDATES_AVAILABLE',
+  'DEFAULT_UPDATE',
+  'INITIAL_UPDATE',
+  'HISTORICAL_UPDATE',
+]);
+
 // Where Plaid sends server-to-server notifications (new transactions ready, an Item
-// breaking, etc.). Nothing acts on specific webhook codes yet beyond logging every one to
-// webhook_log - this is the receiver existing and proven reachable, not full handling of
-// each event type. Public (no requireAuth): Plaid calls this directly, with no user session.
+// breaking, etc.). Every webhook is logged to webhook_log regardless of type; transaction-
+// update codes additionally trigger a real resync of that Item. Public (no requireAuth):
+// Plaid calls this directly, with no user session.
 app.post('/plaid-webhook', async (req, res) => {
   const { webhook_type, webhook_code, item_id } = req.body || {};
   console.log(`[plaid webhook] ${webhook_type}/${webhook_code} for item ${item_id}`);
@@ -239,7 +251,26 @@ app.post('/plaid-webhook', async (req, res) => {
   } catch (err) {
     console.error('Failed to log webhook', err);
   }
+
+  // Acknowledge Plaid immediately - the sync itself runs after responding rather than
+  // blocking it, since Plaid expects a fast response and may retry on timeout.
   res.sendStatus(200);
+
+  if (webhook_type === 'TRANSACTIONS' && TRANSACTIONS_UPDATE_CODES.has(webhook_code) && item_id) {
+    try {
+      const result = await pool.query(
+        'SELECT id, user_id, access_token, cursor, created_at FROM plaid_items WHERE plaid_item_id = $1',
+        [item_id]
+      );
+      const item = result.rows[0];
+      if (item) {
+        await syncOneItem(item, item.user_id);
+        console.log(`[plaid webhook] synced item ${item_id} after ${webhook_code}`);
+      }
+    } catch (err) {
+      console.error(`[plaid webhook] sync failed for item ${item_id}:`, err.response?.data || err.message);
+    }
+  }
 });
 
 // Proves to iOS that this domain is allowed to hand off to the Fenn app for a given path -
