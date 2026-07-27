@@ -176,15 +176,22 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
 // Self-service, immediate, no grace period - per the spec. Plaid Items are removed on
 // Plaid's side first (so we stop being billed for them), then the user row is deleted,
 // which cascades to every other table (transactions, budgets, expenses, bills, sessions).
+// webhook_log isn't a foreign key (see its schema comment), so it needs its own explicit
+// cleanup here - otherwise Plaid-derived data would linger with no remaining business need.
 app.delete('/api/account', requireAuth, async (req, res) => {
   try {
-    const items = await pool.query('SELECT access_token FROM plaid_items WHERE user_id = $1', [req.userId]);
+    const items = await pool.query('SELECT access_token, plaid_item_id FROM plaid_items WHERE user_id = $1', [
+      req.userId,
+    ]);
     for (const item of items.rows) {
       try {
         await plaidClient.itemRemove({ access_token: decryptToken(item.access_token) });
       } catch (err) {
         console.error(err.response ? err.response.data : err);
       }
+    }
+    if (items.rows.length > 0) {
+      await pool.query('DELETE FROM webhook_log WHERE item_id = ANY($1)', [items.rows.map((i) => i.plaid_item_id)]);
     }
 
     await pool.query('DELETE FROM users WHERE id = $1', [req.userId]);
@@ -409,10 +416,11 @@ app.post('/api/plaid_items/:id/reconnected', async (req, res) => {
 // way to remove a bank connection is deleting the whole account, which is too heavy a
 // hammer for "I connected the wrong bank." Removed on Plaid's side first (so billing
 // stops), then the row is deleted, which cascades to that bank's transactions and
-// recurring bills only.
+// recurring bills only - webhook_log needs its own explicit cleanup, same reasoning as
+// account deletion above.
 app.delete('/api/plaid_items/:id', async (req, res) => {
   try {
-    const item = await pool.query('SELECT access_token FROM plaid_items WHERE id = $1 AND user_id = $2', [
+    const item = await pool.query('SELECT access_token, plaid_item_id FROM plaid_items WHERE id = $1 AND user_id = $2', [
       req.params.id,
       req.userId,
     ]);
@@ -426,6 +434,7 @@ app.delete('/api/plaid_items/:id', async (req, res) => {
       console.error(err.response ? err.response.data : err);
     }
 
+    await pool.query('DELETE FROM webhook_log WHERE item_id = $1', [item.rows[0].plaid_item_id]);
     await pool.query('DELETE FROM plaid_items WHERE id = $1 AND user_id = $2', [req.params.id, req.userId]);
     res.json({ ok: true });
   } catch (err) {
