@@ -10,6 +10,21 @@ const { encryptToken, decryptToken } = require('./tokenCrypto');
 const MFA_ISSUER = 'Fenn';
 const BACKUP_CODE_COUNT = 8;
 
+const MIN_PASSWORD_LENGTH = 8;
+
+// Shared by register() and changePassword() - the only two places a password is ever set -
+// so a weak password can't slip in through either path. Length only, not composition
+// rules (uppercase/symbol requirements): NIST's current guidance is that length matters
+// far more than forced complexity, which mostly just pushes people toward predictable
+// substitutions ("Password1!") rather than actually stronger passwords.
+function assertValidPassword(password) {
+  if (!password || password.length < MIN_PASSWORD_LENGTH) {
+    const err = new Error(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
+    err.status = 400;
+    throw err;
+  }
+}
+
 const APPLE_ISSUER = 'https://appleid.apple.com';
 const APPLE_AUDIENCE = process.env.APPLE_BUNDLE_ID || 'com.fennapp.fenn';
 const appleJwks = jwksClient({ jwksUri: 'https://appleid.apple.com/auth/keys', cache: true, cacheMaxAge: 24 * 60 * 60 * 1000 });
@@ -55,6 +70,7 @@ async function createSession(userId, mfaVerified = true) {
 }
 
 async function register({ email, password, marketingConsent }) {
+  assertValidPassword(password);
   const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
   if (existing.rows.length > 0) {
     const err = new Error('An account with that email already exists.');
@@ -102,6 +118,7 @@ async function logout(token) {
 // password_hash at all, and !user.password_hash correctly rejects that case the same way
 // login() does rather than needing a separate check.
 async function changePassword(userId, currentPassword, newPassword) {
+  assertValidPassword(newPassword);
   const result = await pool.query('SELECT password_hash FROM users WHERE id = $1', [userId]);
   const user = result.rows[0];
 
@@ -362,4 +379,5 @@ module.exports = {
   confirmMfa,
   disableMfa,
   verifyMfaLogin,
+  MIN_PASSWORD_LENGTH,
 };

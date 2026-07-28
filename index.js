@@ -16,6 +16,7 @@ const {
   confirmMfa,
   disableMfa,
   verifyMfaLogin,
+  MIN_PASSWORD_LENGTH,
 } = require('./auth');
 const { PRIVACY_POLICY, TERMS_OF_SERVICE } = require('./legalContent');
 
@@ -107,8 +108,8 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     if (!email || !EMAIL_RE.test(email)) {
       return res.status(400).json({ error: 'A valid email is required.' });
     }
-    if (!password || password.length < 8) {
-      return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+    if (!password || password.length < MIN_PASSWORD_LENGTH) {
+      return res.status(400).json({ error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters.` });
     }
     if (!tos_accepted) {
       return res.status(400).json({ error: 'You must accept the Terms of Service and Privacy Policy.' });
@@ -174,8 +175,8 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
     if (!current_password || !new_password) {
       return res.status(400).json({ error: 'Current and new password are required.' });
     }
-    if (new_password.length < 8) {
-      return res.status(400).json({ error: 'New password must be at least 8 characters.' });
+    if (new_password.length < MIN_PASSWORD_LENGTH) {
+      return res.status(400).json({ error: `New password must be at least ${MIN_PASSWORD_LENGTH} characters.` });
     }
     await changePassword(req.userId, current_password, new_password);
     res.json({ ok: true });
