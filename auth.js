@@ -2,7 +2,13 @@ const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const jwksClient = require('jwks-rsa');
+const { generateSecret, generate, verify: verifyTotp, generateURI } = require('otplib');
+const qrcode = require('qrcode');
 const pool = require('./db');
+const { encryptToken, decryptToken } = require('./tokenCrypto');
+
+const MFA_ISSUER = 'Fenn';
+const BACKUP_CODE_COUNT = 8;
 
 const APPLE_ISSUER = 'https://appleid.apple.com';
 const APPLE_AUDIENCE = process.env.APPLE_BUNDLE_ID || 'com.fennapp.fenn';
@@ -34,9 +40,17 @@ function generateToken() {
   return crypto.randomBytes(32).toString('hex');
 }
 
-async function createSession(userId) {
+// mfaVerified defaults true (an ordinary, immediately-usable session) - only ever passed
+// false for an account with MFA enabled, right after a correct password/Apple Sign-In but
+// before a correct MFA code, so requireAuth can reject it everywhere except the one route
+// that verifies the code.
+async function createSession(userId, mfaVerified = true) {
   const token = generateToken();
-  await pool.query('INSERT INTO sessions (user_id, token) VALUES ($1, $2)', [userId, token]);
+  await pool.query('INSERT INTO sessions (user_id, token, mfa_verified) VALUES ($1, $2, $3)', [
+    userId,
+    token,
+    mfaVerified,
+  ]);
   return token;
 }
 
@@ -60,7 +74,9 @@ async function register({ email, password, marketingConsent }) {
 }
 
 async function login({ email, password }) {
-  const result = await pool.query('SELECT id, email, password_hash, tier FROM users WHERE email = $1', [email]);
+  const result = await pool.query('SELECT id, email, password_hash, tier, mfa_enabled FROM users WHERE email = $1', [
+    email,
+  ]);
   const user = result.rows[0];
 
   // Same error for "no such user" and "wrong password" - don't reveal which one it was.
@@ -70,8 +86,12 @@ async function login({ email, password }) {
     throw err;
   }
 
-  const token = await createSession(user.id);
-  return { token, user: { id: user.id, email: user.email, tier: user.tier } };
+  const token = await createSession(user.id, !user.mfa_enabled);
+  return {
+    token,
+    user: { id: user.id, email: user.email, tier: user.tier },
+    mfaRequired: user.mfa_enabled,
+  };
 }
 
 async function logout(token) {
@@ -112,23 +132,25 @@ async function loginWithApple({ identityToken, email: emailFromClient, marketing
   const appleUserId = payload.sub;
   const email = payload.email || emailFromClient || null;
 
-  let result = await pool.query('SELECT id, email, tier FROM users WHERE apple_user_id = $1', [appleUserId]);
+  let result = await pool.query('SELECT id, email, tier, mfa_enabled FROM users WHERE apple_user_id = $1', [
+    appleUserId,
+  ]);
   if (result.rows.length > 0) {
     const user = result.rows[0];
-    const token = await createSession(user.id);
-    return { token, user };
+    const token = await createSession(user.id, !user.mfa_enabled);
+    return { token, user: { id: user.id, email: user.email, tier: user.tier }, mfaRequired: user.mfa_enabled };
   }
 
   // First time this Apple account has signed in here - link it to an existing
   // email/password account with the same email if there is one, rather than
   // silently creating a duplicate account for the same person.
   if (email) {
-    result = await pool.query('SELECT id, email, tier FROM users WHERE email = $1', [email]);
+    result = await pool.query('SELECT id, email, tier, mfa_enabled FROM users WHERE email = $1', [email]);
     if (result.rows.length > 0) {
       const user = result.rows[0];
       await pool.query('UPDATE users SET apple_user_id = $1 WHERE id = $2', [appleUserId, user.id]);
-      const token = await createSession(user.id);
-      return { token, user };
+      const token = await createSession(user.id, !user.mfa_enabled);
+      return { token, user: { id: user.id, email: user.email, tier: user.tier }, mfaRequired: user.mfa_enabled };
     }
   }
 
@@ -153,6 +175,142 @@ async function loginWithApple({ identityToken, email: emailFromClient, marketing
   return { token, user };
 }
 
+// otplib throws (rather than returning { valid: false }) for a malformed code - notably
+// anything that isn't exactly 6 digits, which includes every backup code by design. Without
+// this wrapper, a backup-code attempt would crash instead of falling through to actually
+// check backup codes.
+async function safeVerifyTotp(secret, code) {
+  try {
+    return await verifyTotp({ secret, token: code });
+  } catch (err) {
+    return { valid: false };
+  }
+}
+
+function generateBackupCode() {
+  // 10 hex chars, uppercased for readability (e.g. "3F9A2B7C1D") - not meant to be typed
+  // often, just once in the rare case an authenticator device is lost.
+  return crypto.randomBytes(5).toString('hex').toUpperCase();
+}
+
+// Step 1 of enabling MFA: generates a secret and returns it as a QR code (plus the raw key
+// for manual entry) for the user to add to their authenticator app. Stored as
+// mfa_pending_secret, not mfa_secret - MFA isn't actually turned on until confirmMfa proves
+// the user really did save it somewhere, so an abandoned setup can't silently lock anyone
+// out or leave a secret enabled that was never actually recorded by an authenticator app.
+async function setupMfa(userId, email) {
+  const secret = generateSecret();
+  await pool.query('UPDATE users SET mfa_pending_secret = $1 WHERE id = $2', [encryptToken(secret), userId]);
+  const uri = generateURI({ issuer: MFA_ISSUER, label: email, secret });
+  const qrDataUrl = await qrcode.toDataURL(uri);
+  return { qrDataUrl, manualEntryKey: secret };
+}
+
+// Step 2: user submits a code from their authenticator app, proving setup actually worked.
+// Promotes the pending secret to the real one, turns MFA on, and issues backup codes -
+// shown to the caller this one time only, never retrievable again (only their bcrypt hash
+// is kept). Re-running setup+confirm (e.g. switching authenticator apps) replaces both the
+// secret and all backup codes, invalidating the old ones.
+async function confirmMfa(userId, code) {
+  const result = await pool.query('SELECT mfa_pending_secret FROM users WHERE id = $1', [userId]);
+  const encryptedSecret = result.rows[0]?.mfa_pending_secret;
+  if (!encryptedSecret) {
+    const err = new Error('No MFA setup in progress. Start setup again.');
+    err.status = 400;
+    throw err;
+  }
+
+  const secret = decryptToken(encryptedSecret);
+  const { valid } = await safeVerifyTotp(secret, code);
+  if (!valid) {
+    const err = new Error('Incorrect code. Try again.');
+    err.status = 400;
+    throw err;
+  }
+
+  await pool.query(
+    'UPDATE users SET mfa_secret = $1, mfa_pending_secret = NULL, mfa_enabled = true WHERE id = $2',
+    [encryptedSecret, userId]
+  );
+
+  await pool.query('DELETE FROM mfa_backup_codes WHERE user_id = $1', [userId]);
+  const backupCodes = [];
+  for (let i = 0; i < BACKUP_CODE_COUNT; i++) {
+    const backupCode = generateBackupCode();
+    backupCodes.push(backupCode);
+    const hash = await bcrypt.hash(backupCode, 10);
+    await pool.query('INSERT INTO mfa_backup_codes (user_id, code_hash) VALUES ($1, $2)', [userId, hash]);
+  }
+  return { backupCodes };
+}
+
+// Requires the current password (not just being logged in) so a hijacked but not-yet-MFA'd
+// session can't turn off the one thing standing between it and full account takeover.
+async function disableMfa(userId, password) {
+  const result = await pool.query('SELECT password_hash FROM users WHERE id = $1', [userId]);
+  const user = result.rows[0];
+  if (!user || !user.password_hash || !(await bcrypt.compare(password, user.password_hash))) {
+    const err = new Error('Current password is incorrect.');
+    err.status = 401;
+    throw err;
+  }
+
+  await pool.query(
+    'UPDATE users SET mfa_enabled = false, mfa_secret = NULL, mfa_pending_secret = NULL WHERE id = $1',
+    [userId]
+  );
+  await pool.query('DELETE FROM mfa_backup_codes WHERE user_id = $1', [userId]);
+}
+
+// Called with the still mfa_verified=false session token a successful password/Apple
+// Sign-In just issued, plus either a TOTP code or one of the user's backup codes. On
+// success, flips that same session to verified rather than issuing a new one - the client
+// already has the right token, it just couldn't use it for anything else yet.
+async function verifyMfaLogin(token, code) {
+  const result = await pool.query(
+    `SELECT s.id AS session_id, s.mfa_verified, u.id AS user_id, u.email, u.tier, u.mfa_secret
+     FROM sessions s JOIN users u ON u.id = s.user_id
+     WHERE s.token = $1`,
+    [token]
+  );
+  const row = result.rows[0];
+  if (!row) {
+    const err = new Error('Session not found. Log in again.');
+    err.status = 401;
+    throw err;
+  }
+
+  const user = { id: row.user_id, email: row.email, tier: row.tier };
+  if (row.mfa_verified) {
+    // Already verified (e.g. a retried request) - idempotent success, not an error.
+    return { user };
+  }
+
+  const secret = decryptToken(row.mfa_secret);
+  const { valid } = await safeVerifyTotp(secret, code);
+  if (valid) {
+    await pool.query('UPDATE sessions SET mfa_verified = true WHERE id = $1', [row.session_id]);
+    return { user };
+  }
+
+  // Not a valid TOTP code - fall back to checking unused backup codes.
+  const backupCodes = await pool.query(
+    'SELECT id, code_hash FROM mfa_backup_codes WHERE user_id = $1 AND used_at IS NULL',
+    [row.user_id]
+  );
+  for (const backupCode of backupCodes.rows) {
+    if (await bcrypt.compare(code, backupCode.code_hash)) {
+      await pool.query('UPDATE mfa_backup_codes SET used_at = now() WHERE id = $1', [backupCode.id]);
+      await pool.query('UPDATE sessions SET mfa_verified = true WHERE id = $1', [row.session_id]);
+      return { user };
+    }
+  }
+
+  const err = new Error('Incorrect code.');
+  err.status = 401;
+  throw err;
+}
+
 // Sliding expiration on top of (not instead of) the biometric app lock - see the comment
 // on sessions.last_used_at in schema.sql for why this exists.
 const SESSION_LIFETIME_DAYS = 90;
@@ -166,11 +324,17 @@ async function requireAuth(req, res, next) {
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
 
   const result = await pool.query(
-    `SELECT user_id FROM sessions
+    `SELECT user_id, mfa_verified FROM sessions
      WHERE token = $1 AND last_used_at > now() - interval '${SESSION_LIFETIME_DAYS} days'`,
     [token]
   );
   if (result.rows.length === 0) return res.status(401).json({ error: 'Not authenticated' });
+
+  // A session created right after a correct password/Apple Sign-In for an MFA-enabled
+  // account, but before the correct code - can't be used for anything else until then.
+  if (!result.rows[0].mfa_verified) {
+    return res.status(401).json({ error: 'MFA verification required', mfaRequired: true });
+  }
 
   req.userId = result.rows[0].user_id;
 
@@ -187,4 +351,15 @@ async function requireAuth(req, res, next) {
   next();
 }
 
-module.exports = { register, login, loginWithApple, logout, requireAuth, changePassword };
+module.exports = {
+  register,
+  login,
+  loginWithApple,
+  logout,
+  requireAuth,
+  changePassword,
+  setupMfa,
+  confirmMfa,
+  disableMfa,
+  verifyMfaLogin,
+};

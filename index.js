@@ -5,7 +5,18 @@ const rateLimit = require('express-rate-limit');
 const plaidClient = require('./plaidClient');
 const pool = require('./db');
 const { encryptToken, decryptToken } = require('./tokenCrypto');
-const { register, login, loginWithApple, logout, requireAuth, changePassword } = require('./auth');
+const {
+  register,
+  login,
+  loginWithApple,
+  logout,
+  requireAuth,
+  changePassword,
+  setupMfa,
+  confirmMfa,
+  disableMfa,
+  verifyMfaLogin,
+} = require('./auth');
 const { PRIVACY_POLICY, TERMS_OF_SERVICE } = require('./legalContent');
 
 const app = express();
@@ -115,8 +126,8 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required.' });
     }
-    const { token, user } = await login({ email, password });
-    res.json({ token, user });
+    const { token, user, mfaRequired } = await login({ email, password });
+    res.json({ token, user, mfa_required: mfaRequired });
   } catch (err) {
     res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to log in' });
   }
@@ -128,13 +139,13 @@ app.post('/api/auth/apple', authLimiter, async (req, res) => {
     if (!identity_token) {
       return res.status(400).json({ error: 'identity_token is required.' });
     }
-    const { token, user } = await loginWithApple({
+    const { token, user, mfaRequired } = await loginWithApple({
       identityToken: identity_token,
       email,
       marketingConsent: marketing_consent,
       tosAccepted: tos_accepted,
     });
-    res.json({ token, user });
+    res.json({ token, user, mfa_required: mfaRequired });
   } catch (err) {
     res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to sign in with Apple' });
   }
@@ -151,7 +162,7 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   // decide whether "Change password" makes sense to show at all - an Apple-only account
   // has no password to change.
   const result = await pool.query(
-    'SELECT id, email, tier, created_at, (password_hash IS NOT NULL) AS has_password FROM users WHERE id = $1',
+    'SELECT id, email, tier, created_at, (password_hash IS NOT NULL) AS has_password, mfa_enabled FROM users WHERE id = $1',
     [req.userId]
   );
   res.json(result.rows[0] || null);
@@ -170,6 +181,61 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to change password' });
+  }
+});
+
+// Step 1 of turning on MFA: returns a QR code for the user's authenticator app. Doesn't
+// take effect until /api/auth/mfa/confirm proves the user actually saved it.
+app.post('/api/auth/mfa/setup', requireAuth, async (req, res) => {
+  try {
+    const userResult = await pool.query('SELECT email FROM users WHERE id = $1', [req.userId]);
+    const { qrDataUrl, manualEntryKey } = await setupMfa(req.userId, userResult.rows[0].email);
+    res.json({ qr_data_url: qrDataUrl, manual_entry_key: manualEntryKey });
+  } catch (err) {
+    if (!err.status) console.error(`mfa/setup failed for user ${req.userId}:`, err);
+    res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to start MFA setup' });
+  }
+});
+
+app.post('/api/auth/mfa/confirm', requireAuth, async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: 'Code is required.' });
+    const { backupCodes } = await confirmMfa(req.userId, code);
+    res.json({ backup_codes: backupCodes });
+  } catch (err) {
+    if (!err.status) console.error(`mfa/confirm failed for user ${req.userId}:`, err);
+    res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to confirm MFA setup' });
+  }
+});
+
+app.post('/api/auth/mfa/disable', requireAuth, async (req, res) => {
+  try {
+    const { password } = req.body;
+    if (!password) return res.status(400).json({ error: 'Password is required.' });
+    await disableMfa(req.userId, password);
+    res.json({ ok: true });
+  } catch (err) {
+    if (!err.status) console.error(`mfa/disable failed for user ${req.userId}:`, err);
+    res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to disable MFA' });
+  }
+});
+
+// Deliberately not behind requireAuth - the session token this is called with is still
+// mfa_verified=false at this point, which requireAuth would reject. The token is supplied
+// explicitly in the body (not the Authorization header) for the same reason: the app
+// shouldn't persist this token as "the" session until this call actually succeeds.
+app.post('/api/auth/mfa/verify-login', authLimiter, async (req, res) => {
+  try {
+    const { token, code } = req.body;
+    if (!token || !code) return res.status(400).json({ error: 'Token and code are required.' });
+    const { user } = await verifyMfaLogin(token, code);
+    res.json({ token, user });
+  } catch (err) {
+    // Never log the token or code themselves - both are bearer credentials for this
+    // request, same reasoning as never logging a password.
+    if (!err.status) console.error('mfa/verify-login failed:', err);
+    res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to verify code' });
   }
 });
 

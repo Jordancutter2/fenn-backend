@@ -19,6 +19,25 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS marketing_consent BOOLEAN NOT NULL DE
 ALTER TABLE users ADD COLUMN IF NOT EXISTS tier TEXT NOT NULL DEFAULT 'free';
 -- Apple's stable per-user identifier (the JWT `sub` claim), null for email/password-only accounts.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_user_id TEXT UNIQUE;
+-- TOTP secret, encrypted at rest the same way as Plaid access tokens (see tokenCrypto.js).
+-- mfa_pending_secret holds a newly-generated secret during setup, before the user has
+-- proven they actually scanned it by submitting a valid code - only promoted to mfa_secret
+-- (and mfa_enabled set true) on confirmation, so a setup flow abandoned partway through
+-- never silently turns on MFA with a secret the user never actually saved anywhere.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_secret TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_pending_secret TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_enabled BOOLEAN NOT NULL DEFAULT false;
+
+-- One-time-use recovery codes for when someone loses their authenticator device. Hashed
+-- with bcrypt like passwords, never stored or logged in plaintext - shown to the user
+-- exactly once, at the moment MFA setup is confirmed.
+CREATE TABLE IF NOT EXISTS mfa_backup_codes (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  code_hash TEXT NOT NULL,
+  used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 -- Superseded by a per-transaction override (transactions.user_excluded, tri-state) - a
 -- single global toggle plus a separate per-bill flag couldn't actually let someone include
 -- one specific transaction (a bill that's secretly a transfer, a refund, etc.), which was
@@ -41,6 +60,11 @@ CREATE TABLE IF NOT EXISTS sessions (
 -- every authenticated request, so daily use never expires a session - only one that's
 -- genuinely been abandoned or leaked eventually stops working.
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ NOT NULL DEFAULT now();
+-- Defaults true so every existing session, and every login for an account without MFA
+-- enabled, is unaffected. Only set false for the brief window between a correct password
+-- (or Apple Sign-In) and a correct MFA code, for an account with MFA turned on - requireAuth
+-- rejects a session in this state for every route except the one that verifies the code.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS mfa_verified BOOLEAN NOT NULL DEFAULT true;
 
 -- One row per bank connection (a Plaid "Item"). A user can have up to 5 per the spec.
 CREATE TABLE IF NOT EXISTS plaid_items (

@@ -20,8 +20,10 @@
     "express-rate-limit": "^8.6.0",
     "jsonwebtoken": "^9.0.3",
     "jwks-rsa": "^4.1.0",
+    "otplib": "^13.4.1",
     "pg": "^8.22.0",
-    "plaid": "^43.0.0"
+    "plaid": "^43.0.0",
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"
