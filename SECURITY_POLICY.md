@@ -44,6 +44,13 @@ revised as the team grows.
 - Login and registration endpoints are rate-limited per IP address to
   mitigate brute-force credential attacks.
 - Apple Sign-In is supported as an alternative to password-based auth.
+- Optional consumer-facing multi-factor authentication (TOTP, compatible
+  with standard authenticator apps) is available; when enabled, a session
+  from a correct password or Apple Sign-In is unusable for anything else
+  until a second factor is also verified. One-time backup codes (hashed,
+  single-use) are issued at setup for recovery if the authenticator device
+  is lost. The TOTP secret is encrypted at rest the same way as Plaid
+  access tokens.
 
 ### Application-level safeguards
 - Database queries are parameterized throughout (no string-concatenated
@@ -236,13 +243,6 @@ vendor list.
 In the interest of this policy being accurate rather than aspirational, gaps
 are called out explicitly here rather than left implicit:
 
-- **No consumer-facing multi-factor authentication yet.** Login is
-  single-factor (password, or Sign in with Apple). A device-level Face
-  ID/Touch ID lock is enabled by default on supported hardware, but that
-  protects against someone accessing an already-logged-in device, not
-  against remote credential-based account takeover. Account-level MFA
-  (e.g., email or TOTP-based) is planned as the user base grows beyond the
-  initial closed beta.
 - **No automated employee de-provisioning.** No tooling exists to
   automatically revoke access when personnel leave, because there are no
   personnel beyond the founder. Unlike RBAC, zero trust, and centralized
@@ -252,8 +252,8 @@ are called out explicitly here rather than left implicit:
   needed. This will be built once Fenn actually has personnel for it to
   apply to, not before.
 
-Both gaps above are proportionate to Fenn's current stage (pre-launch,
-single founder, no employees) rather than oversights, and will be
+This gap is proportionate to Fenn's current stage (pre-launch,
+single founder, no employees) rather than an oversight, and will be
 revisited as the product and team grow.
 
 ## 10. Contact
