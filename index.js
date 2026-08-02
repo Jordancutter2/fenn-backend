@@ -1,6 +1,9 @@
 require('dotenv').config({ quiet: true });
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const plaidClient = require('./plaidClient');
 const pool = require('./db');
@@ -35,8 +38,21 @@ const app = express();
 // client could forge.
 app.set('trust proxy', true);
 
+// Baseline security headers (X-Content-Type-Options, X-Frame-Options, a default
+// Content-Security-Policy, HSTS, etc.) on every response. The one incidental cost:
+// public/index.html (an explicitly-labeled throwaway Plaid sandbox test harness, not part
+// of the real app) loads an external Plaid CDN script and runs its own logic from inline
+// <script> tags - helmet's default CSP (script-src 'self', no unsafe-inline) blocks both,
+// so that page's buttons stop working. The real app never touches this route at all (it's
+// a native client, not a browser), so this only affects a dev-only test page reached by
+// manually visiting the backend's own root URL.
+app.use(helmet());
 app.use(cors());
-app.use(express.json());
+// Stashes the raw request body bytes on every request (cheap - just a Buffer reference,
+// not a copy) - needed specifically to verify the Plaid webhook's signature below, which
+// requires hashing the *exact* bytes Plaid sent, not a re-serialized version of the
+// already-parsed JSON (whitespace/key-order differences would change the hash).
+app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 app.use(express.static('public'));
 app.use((req, res, next) => {
   console.log(`[request] ${req.method} ${req.originalUrl}`);
@@ -178,7 +194,10 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
     if (new_password.length < MIN_PASSWORD_LENGTH) {
       return res.status(400).json({ error: `New password must be at least ${MIN_PASSWORD_LENGTH} characters.` });
     }
-    await changePassword(req.userId, current_password, new_password);
+    // Same header re-parse as logout above - requireAuth already validated this is a
+    // well-formed Bearer token matching an active session, so this is safe to trust here.
+    const currentSessionToken = (req.headers.authorization || '').slice(7);
+    await changePassword(req.userId, current_password, new_password, currentSessionToken);
     res.json({ ok: true });
   } catch (err) {
     res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to change password' });
@@ -316,10 +335,60 @@ const TRANSACTIONS_UPDATE_CODES = new Set([
 // happened rather than repeat the same live Plaid call and insert loop for nothing new.
 const TRANSACTIONS_SYNC_DEBOUNCE_MS = 10_000;
 
+// Plaid signs every webhook with a JWT (ES256) in the Plaid-Verification header, keyed by
+// a `kid` that identifies which of Plaid's public keys signed it - fetched via
+// webhookVerificationKeyGet and cached, since Plaid explicitly documents these as stable
+// and cacheable. Without this, /plaid-webhook (below) has no way to tell a genuine Plaid
+// call apart from anyone who POSTs a matching item_id - Plaid's item_id values aren't
+// secret, so this isn't a hypothetical: it's the only thing standing between "Plaid told
+// us this" and "anyone on the internet told us this."
+const plaidWebhookKeyCache = new Map(); // kid -> KeyObject
+const PLAID_WEBHOOK_MAX_AGE_SECONDS = 5 * 60; // rejects a replayed old JWT, per Plaid's own docs
+
+async function getPlaidWebhookVerificationKey(kid, { forceRefresh = false } = {}) {
+  if (!forceRefresh && plaidWebhookKeyCache.has(kid)) return plaidWebhookKeyCache.get(kid);
+  const response = await plaidClient.webhookVerificationKeyGet({ key_id: kid });
+  // Plaid's key is JSON Web Key (EC/P-256) - Node's own crypto module converts this
+  // directly into a usable key object, no extra dependency (like jwk-to-pem) needed.
+  const keyObject = crypto.createPublicKey({ key: response.data.key, format: 'jwk' });
+  plaidWebhookKeyCache.set(kid, keyObject);
+  return keyObject;
+}
+
+// Verifies both that the JWT itself is genuinely signed by Plaid (not just well-formed)
+// and that it actually attests to *this* request's body - a valid signature over a
+// different, older payload would otherwise let a captured webhook be replayed with
+// different data spliced in. Returns nothing on success; throws with a short, specific
+// reason on any failure so a rejected webhook is easy to diagnose from logs alone.
+async function verifyPlaidWebhook(req) {
+  const signedJwt = req.headers['plaid-verification'];
+  if (!signedJwt) throw new Error('missing Plaid-Verification header');
+
+  const decoded = jwt.decode(signedJwt, { complete: true });
+  const kid = decoded?.header?.kid;
+  if (!kid) throw new Error('could not read kid from JWT header');
+
+  let payload;
+  try {
+    const key = await getPlaidWebhookVerificationKey(kid);
+    payload = jwt.verify(signedJwt, key, { algorithms: ['ES256'], maxAge: PLAID_WEBHOOK_MAX_AGE_SECONDS });
+  } catch (err) {
+    // The cached key could just be stale (Plaid rotates these occasionally) - retry once
+    // against a freshly-fetched key before actually giving up, per Plaid's own guidance.
+    const key = await getPlaidWebhookVerificationKey(kid, { forceRefresh: true });
+    payload = jwt.verify(signedJwt, key, { algorithms: ['ES256'], maxAge: PLAID_WEBHOOK_MAX_AGE_SECONDS });
+  }
+
+  if (!req.rawBody) throw new Error('no raw body captured to verify');
+  const actualBodyHash = crypto.createHash('sha256').update(req.rawBody).digest('hex');
+  if (actualBodyHash !== payload.request_body_sha256) throw new Error('request_body_sha256 mismatch');
+}
+
 // Where Plaid sends server-to-server notifications (new transactions ready, an Item
 // breaking, etc.). Every webhook is logged to webhook_log regardless of type; transaction-
 // update codes additionally trigger a real resync of that Item. Public (no requireAuth):
-// Plaid calls this directly, with no user session.
+// Plaid calls this directly, with no user session - verifyPlaidWebhook above is what
+// stands in for that, checked before anything else here runs.
 // Everything here runs BEFORE responding to Plaid, not after - Railway doesn't guarantee
 // background work continues once a request's HTTP response has been sent, which silently
 // dropped the Transactions resync in production (confirmed: it ran correctly every time
@@ -328,6 +397,13 @@ const TRANSACTIONS_SYNC_DEBOUNCE_MS = 10_000;
 // res.sendStatus() just wasn't reliably finishing). Plaid tolerates several seconds before
 // treating a webhook as failed, so doing the work synchronously here is well within that.
 app.post('/plaid-webhook', async (req, res) => {
+  try {
+    await verifyPlaidWebhook(req);
+  } catch (err) {
+    console.error('[plaid webhook] rejected - failed verification:', err.message);
+    return res.sendStatus(401);
+  }
+
   const { webhook_type, webhook_code, item_id } = req.body || {};
   console.log(`[plaid webhook] ${webhook_type}/${webhook_code} for item ${item_id}`);
   let webhookLogId = null;

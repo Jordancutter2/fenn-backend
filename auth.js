@@ -117,7 +117,7 @@ async function logout(token) {
 // Only for accounts that already have a password set - an Apple-only account has no
 // password_hash at all, and !user.password_hash correctly rejects that case the same way
 // login() does rather than needing a separate check.
-async function changePassword(userId, currentPassword, newPassword) {
+async function changePassword(userId, currentPassword, newPassword, currentSessionToken) {
   assertValidPassword(newPassword);
   const result = await pool.query('SELECT password_hash FROM users WHERE id = $1', [userId]);
   const user = result.rows[0];
@@ -130,6 +130,13 @@ async function changePassword(userId, currentPassword, newPassword) {
 
   const newHash = await bcrypt.hash(newPassword, 10);
   await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, userId]);
+
+  // A stolen session token should stop working the moment the legitimate owner changes
+  // their password - without this, whoever had it keeps full access indefinitely,
+  // regardless of the password change. Keeps the session making this very request alive
+  // (excluded by token) so changing your own password doesn't immediately log out the
+  // device you're sitting at right now.
+  await pool.query('DELETE FROM sessions WHERE user_id = $1 AND token != $2', [userId, currentSessionToken]);
 }
 
 // Apple only sends the user's email on the very first authorization ever for this app -

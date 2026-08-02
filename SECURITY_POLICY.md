@@ -1,6 +1,6 @@
 # Fenn Information Security Policy
 
-**Last reviewed:** 2026-07-27
+**Last reviewed:** 2026-08-02
 **Owner:** Jordan Cutter (founder/sole operator)
 
 ## 1. Purpose and scope
@@ -41,8 +41,13 @@ revised as the team grows.
   logged.
 - Sessions use a sliding-window expiration (90 days from last use); a
   session unused for that long is invalidated and requires re-authentication.
-- Login and registration endpoints are rate-limited per IP address to
-  mitigate brute-force credential attacks.
+- Changing a password invalidates every other active session for that
+  account immediately (the session used to make the change itself is left
+  alone, so the change doesn't log out the device it was made from) - this
+  contains a stolen session token the moment the legitimate owner changes
+  their password, rather than leaving it valid indefinitely.
+- Login, registration, and MFA code verification endpoints are rate-limited
+  per IP address to mitigate brute-force credential/code-guessing attacks.
 - Apple Sign-In is supported as an alternative to password-based auth.
 - Optional consumer-facing multi-factor authentication (TOTP, compatible
   with standard authenticator apps) is available; when enabled, a session
@@ -55,6 +60,18 @@ revised as the team grows.
 ### Application-level safeguards
 - Database queries are parameterized throughout (no string-concatenated
   SQL), mitigating SQL injection.
+- Every API endpoint that reads or modifies a specific record (an expense, a
+  bill, a linked bank, a transaction) scopes its query to the authenticated
+  user's own id, not just the record's id - an authenticated user cannot
+  access or modify another user's data by guessing or iterating IDs.
+- Inbound Plaid webhooks are cryptographically verified (the JWT Plaid signs
+  into the `Plaid-Verification` header, per Plaid's own documented process)
+  before any of their contents are trusted or acted on - without this, a
+  webhook's `item_id` isn't secret, so anything reachable at the webhook URL
+  could otherwise spoof Plaid and trigger a sync or forge connection-status
+  flags for a targeted item.
+- Standard HTTP security headers (baseline CSP, X-Content-Type-Options,
+  HSTS, and others) are set on every response via `helmet`.
 - Crash/error reporting (Sentry) is configured to minimize collected user
   data: default PII collection (IP address) is disabled, and optional
   features that would capture UI content (Session Replay) are not enabled.
