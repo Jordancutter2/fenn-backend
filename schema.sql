@@ -38,6 +38,22 @@ CREATE TABLE IF NOT EXISTS mfa_backup_codes (
   used_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Emailed 6-digit codes for "forgot password" - same hashed-at-rest, single-use shape as
+-- mfa_backup_codes above, plus expires_at since unlike a backup code (valid until spent),
+-- a reset code that's never used should stop being usable after a short window rather
+-- than sitting valid forever. Old rows for a user aren't deleted when a new one's
+-- requested - requestPasswordReset (auth.js) just treats only the newest as current,
+-- so a second "resend code" tap can't strand someone on an email with a code that no
+-- longer matches what the server considers active.
+CREATE TABLE IF NOT EXISTS password_reset_codes (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  code_hash TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 -- Superseded by a per-transaction override (transactions.user_excluded, tri-state) - a
 -- single global toggle plus a separate per-bill flag couldn't actually let someone include
 -- one specific transaction (a bill that's secretly a transfer, a refund, etc.), which was

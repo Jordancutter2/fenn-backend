@@ -15,6 +15,8 @@ const {
   logout,
   requireAuth,
   changePassword,
+  requestPasswordReset,
+  resetPassword,
   setupMfa,
   confirmMfa,
   disableMfa,
@@ -165,6 +167,33 @@ app.post('/api/auth/apple', authLimiter, async (req, res) => {
     res.json({ token, user, mfa_required: mfaRequired });
   } catch (err) {
     res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to sign in with Apple' });
+  }
+});
+
+// Always the same response regardless of whether the email matched an account or the
+// email actually sent - see requestPasswordReset's own comment in auth.js for why. Rate
+// limited the same as login/register, since this is otherwise a free way to trigger an
+// email send (and, without a limit, to brute-force-probe which addresses have accounts).
+app.post('/api/auth/request-password-reset', authLimiter, async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    if (email) await requestPasswordReset(email);
+  } catch (err) {
+    console.error(err);
+  }
+  res.json({ ok: true });
+});
+
+app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
+  try {
+    const { email, code, new_password } = req.body || {};
+    if (!email || !code || !new_password) {
+      return res.status(400).json({ error: 'Email, code, and new password are required.' });
+    }
+    await resetPassword({ email, code, newPassword: new_password });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to reset password' });
   }
 });
 

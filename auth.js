@@ -6,9 +6,11 @@ const { generateSecret, generate, verify: verifyTotp, generateURI } = require('o
 const qrcode = require('qrcode');
 const pool = require('./db');
 const { encryptToken, decryptToken } = require('./tokenCrypto');
+const { sendPasswordResetEmail } = require('./emailClient');
 
 const MFA_ISSUER = 'Fenn';
 const BACKUP_CODE_COUNT = 8;
+const RESET_CODE_EXPIRY_MS = 15 * 60 * 1000;
 
 const MIN_PASSWORD_LENGTH = 8;
 
@@ -137,6 +139,84 @@ async function changePassword(userId, currentPassword, newPassword, currentSessi
   // (excluded by token) so changing your own password doesn't immediately log out the
   // device you're sitting at right now.
   await pool.query('DELETE FROM sessions WHERE user_id = $1 AND token != $2', [userId, currentSessionToken]);
+}
+
+function generateResetCode() {
+  // crypto.randomInt's range is inclusive-start/exclusive-end, so this is always exactly
+  // 6 digits - no zero-padding ever needed, unlike Math.random-based approaches.
+  return String(crypto.randomInt(100000, 1000000));
+}
+
+// Always resolves the same way regardless of whether the email matches an account - same
+// "don't reveal which one it was" reasoning as login()'s identical error for "no such
+// user" and "wrong password." A different response here (or skipping the email step for
+// an unknown address) would let someone enumerate which emails have Fenn accounts just by
+// watching how this endpoint responds. Also a silent no-op for an Apple-only account (no
+// password_hash) - there's no password to reset, and emailing a code that could never
+// actually be used anywhere would just be confusing, not helpful.
+async function requestPasswordReset(email) {
+  const result = await pool.query('SELECT id, password_hash FROM users WHERE email = $1', [email]);
+  const user = result.rows[0];
+  if (!user || !user.password_hash) return;
+
+  const code = generateResetCode();
+  const codeHash = await bcrypt.hash(code, 10);
+  const expiresAt = new Date(Date.now() + RESET_CODE_EXPIRY_MS);
+  await pool.query('INSERT INTO password_reset_codes (user_id, code_hash, expires_at) VALUES ($1, $2, $3)', [
+    user.id,
+    codeHash,
+    expiresAt,
+  ]);
+
+  try {
+    await sendPasswordResetEmail(email, code);
+  } catch (err) {
+    // Swallowed, not thrown - this route always responds the same way regardless of
+    // whether the account exists, so a real send failure (misconfigured API key, Resend
+    // outage) can't become a second way to distinguish "no such account" from "something's
+    // broken." Still logged so a genuine outage is visible on the server side.
+    console.error('Failed to send password reset email:', err);
+  }
+}
+
+// The email + code pair together identify which reset request this is. Only the most
+// recently requested, not-yet-used, not-yet-expired code for that user is ever valid - a
+// stale code from an earlier "resend" tap can't be replayed after a newer one's been sent,
+// since ORDER BY created_at DESC LIMIT 1 always checks against the latest one only.
+async function resetPassword({ email, code, newPassword }) {
+  assertValidPassword(newPassword);
+
+  const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+  const user = userResult.rows[0];
+
+  // Same generic error regardless of which part is wrong (no such user, no pending code,
+  // expired code, wrong code) - same "don't reveal which one it was" reasoning as login().
+  const invalidCodeError = () => {
+    const err = new Error('Invalid or expired reset code.');
+    err.status = 400;
+    throw err;
+  };
+  if (!user) invalidCodeError();
+
+  const codeResult = await pool.query(
+    `SELECT id, code_hash FROM password_reset_codes
+     WHERE user_id = $1 AND used_at IS NULL AND expires_at > now()
+     ORDER BY created_at DESC LIMIT 1`,
+    [user.id]
+  );
+  const resetRow = codeResult.rows[0];
+  if (!resetRow || !(await bcrypt.compare(code, resetRow.code_hash))) invalidCodeError();
+
+  const newHash = await bcrypt.hash(newPassword, 10);
+  await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, user.id]);
+  await pool.query('UPDATE password_reset_codes SET used_at = now() WHERE id = $1', [resetRow.id]);
+
+  // Unlike changePassword above (which keeps the current device's session alive, since
+  // that's the session making the request), there's no "current session" to preserve here
+  // at all - whoever is resetting isn't authenticated yet, and a forgotten-password reset
+  // is exactly the moment an account may have been compromised, so every existing session
+  // ending here is the safer default, not an exception to carve out.
+  await pool.query('DELETE FROM sessions WHERE user_id = $1', [user.id]);
 }
 
 // Apple only sends the user's email on the very first authorization ever for this app -
@@ -382,6 +462,8 @@ module.exports = {
   logout,
   requireAuth,
   changePassword,
+  requestPasswordReset,
+  resetPassword,
   setupMfa,
   confirmMfa,
   disableMfa,
