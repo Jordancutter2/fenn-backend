@@ -83,7 +83,7 @@ async function register({ email, password, marketingConsent }) {
   const passwordHash = await bcrypt.hash(password, 10);
   const result = await pool.query(
     `INSERT INTO users (email, password_hash, tos_accepted_at, marketing_consent)
-     VALUES ($1, $2, now(), $3) RETURNING id, email, tier`,
+     VALUES ($1, $2, now(), $3) RETURNING id, email, tier, created_at`,
     [email, passwordHash, !!marketingConsent]
   );
   const user = result.rows[0];
@@ -92,9 +92,10 @@ async function register({ email, password, marketingConsent }) {
 }
 
 async function login({ email, password }) {
-  const result = await pool.query('SELECT id, email, password_hash, tier, mfa_enabled FROM users WHERE email = $1', [
-    email,
-  ]);
+  const result = await pool.query(
+    'SELECT id, email, password_hash, tier, mfa_enabled, created_at FROM users WHERE email = $1',
+    [email]
+  );
   const user = result.rows[0];
 
   // Same error for "no such user" and "wrong password" - don't reveal which one it was.
@@ -107,7 +108,16 @@ async function login({ email, password }) {
   const token = await createSession(user.id, !user.mfa_enabled);
   return {
     token,
-    user: { id: user.id, email: user.email, tier: user.tier },
+    // created_at matters here, not just cosmetically - userCreatedAt (RingScreen.js,
+    // HistoryScreen.js) bounds how far back streak history gets scanned, so that no day
+    // from before the account existed reads as a fake "$0 spent, under budget" day. This
+    // response used to omit it entirely, silently disabling that bound for anyone who
+    // just went through a genuine login() call (as opposed to resuming a session via
+    // getMe(), which already included it) - surfaced as an absurdly long streak (e.g.
+    // 247 weeks) for an account with little real spending, the exact same underlying
+    // failure mode already documented and fixed once for daily streaks specifically, just
+    // via a different root cause this time.
+    user: { id: user.id, email: user.email, tier: user.tier, created_at: user.created_at },
     mfaRequired: user.mfa_enabled,
   };
 }
@@ -236,25 +246,35 @@ async function loginWithApple({ identityToken, email: emailFromClient, marketing
   const appleUserId = payload.sub;
   const email = payload.email || emailFromClient || null;
 
-  let result = await pool.query('SELECT id, email, tier, mfa_enabled FROM users WHERE apple_user_id = $1', [
+  // created_at included in every branch below - see login()'s own comment for why it
+  // has to be there, not just cosmetic.
+  let result = await pool.query('SELECT id, email, tier, mfa_enabled, created_at FROM users WHERE apple_user_id = $1', [
     appleUserId,
   ]);
   if (result.rows.length > 0) {
     const user = result.rows[0];
     const token = await createSession(user.id, !user.mfa_enabled);
-    return { token, user: { id: user.id, email: user.email, tier: user.tier }, mfaRequired: user.mfa_enabled };
+    return {
+      token,
+      user: { id: user.id, email: user.email, tier: user.tier, created_at: user.created_at },
+      mfaRequired: user.mfa_enabled,
+    };
   }
 
   // First time this Apple account has signed in here - link it to an existing
   // email/password account with the same email if there is one, rather than
   // silently creating a duplicate account for the same person.
   if (email) {
-    result = await pool.query('SELECT id, email, tier, mfa_enabled FROM users WHERE email = $1', [email]);
+    result = await pool.query('SELECT id, email, tier, mfa_enabled, created_at FROM users WHERE email = $1', [email]);
     if (result.rows.length > 0) {
       const user = result.rows[0];
       await pool.query('UPDATE users SET apple_user_id = $1 WHERE id = $2', [appleUserId, user.id]);
       const token = await createSession(user.id, !user.mfa_enabled);
-      return { token, user: { id: user.id, email: user.email, tier: user.tier }, mfaRequired: user.mfa_enabled };
+      return {
+        token,
+        user: { id: user.id, email: user.email, tier: user.tier, created_at: user.created_at },
+        mfaRequired: user.mfa_enabled,
+      };
     }
   }
 
@@ -271,7 +291,7 @@ async function loginWithApple({ identityToken, email: emailFromClient, marketing
 
   const insertResult = await pool.query(
     `INSERT INTO users (email, apple_user_id, tos_accepted_at, marketing_consent)
-     VALUES ($1, $2, now(), $3) RETURNING id, email, tier`,
+     VALUES ($1, $2, now(), $3) RETURNING id, email, tier, created_at`,
     [email, appleUserId, !!marketingConsent]
   );
   const user = insertResult.rows[0];
@@ -372,7 +392,7 @@ async function disableMfa(userId, password) {
 // already has the right token, it just couldn't use it for anything else yet.
 async function verifyMfaLogin(token, code) {
   const result = await pool.query(
-    `SELECT s.id AS session_id, s.mfa_verified, u.id AS user_id, u.email, u.tier, u.mfa_secret
+    `SELECT s.id AS session_id, s.mfa_verified, u.id AS user_id, u.email, u.tier, u.mfa_secret, u.created_at
      FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token = $1`,
     [token]
@@ -384,7 +404,9 @@ async function verifyMfaLogin(token, code) {
     throw err;
   }
 
-  const user = { id: row.user_id, email: row.email, tier: row.tier };
+  // created_at included here too - see login()'s own comment for why it has to be, not
+  // just cosmetic.
+  const user = { id: row.user_id, email: row.email, tier: row.tier, created_at: row.created_at };
   if (row.mfa_verified) {
     // Already verified (e.g. a retried request) - idempotent success, not an error.
     return { user };
