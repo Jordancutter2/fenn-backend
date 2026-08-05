@@ -826,7 +826,7 @@ app.get('/api/transactions', async (req, res) => {
         // as a full ISO timestamp shifted by the server's local timezone (e.g.
         // "2026-07-13T06:00:00.000Z" for Mountain Time), not the plain "2026-07-13" every
         // date-string helper in the app (parseDateKey, etc.) expects.
-        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pending, t.pfc_primary,
+        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pending, t.pfc_primary, t.is_recurring_bill,
            CASE
              WHEN t.amount <= 0 THEN true
              WHEN t.user_excluded IS NOT NULL THEN t.user_excluded
