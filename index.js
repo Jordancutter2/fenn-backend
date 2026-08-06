@@ -971,7 +971,12 @@ app.get('/api/bills', async (req, res) => {
       // historical view regardless of when the Item was actually connected, so without a
       // floor here a bill whose last real occurrence sits outside the window Fenn actually
       // imported transactions for would still show up, with nothing behind it to link to.
-      `SELECT rb.id, rb.merchant_name, rb.description, rb.average_amount, rb.last_amount, rb.frequency, rb.last_date, rb.is_active, rb.user_included
+      // to_char, not a bare column - pg's driver otherwise serializes a raw DATE column as
+      // a full ISO timestamp (e.g. "2026-07-13T06:00:00.000Z"), and the frontend's
+      // parseDateKey splits on '-' expecting a plain 'YYYY-MM-DD' string - fed that ISO
+      // string instead, it silently produces an Invalid Date (confirmed live: this was
+      // showing "last Invalid Date - next ~Invalid Date" for every bill).
+      `SELECT rb.id, rb.merchant_name, rb.description, rb.average_amount, rb.last_amount, rb.frequency, to_char(rb.last_date, 'YYYY-MM-DD') AS last_date, rb.is_active, rb.user_included
        FROM recurring_bills rb
        JOIN plaid_items pi ON pi.id = rb.plaid_item_id
        WHERE rb.user_id = $1 AND rb.is_active = true AND rb.average_amount > 0
