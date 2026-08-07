@@ -799,6 +799,19 @@ app.post('/api/sync_transactions', async (req, res) => {
 const AUTO_EXCLUDED_PFC_PRIMARY = ['TRANSFER_IN', 'TRANSFER_OUT'];
 const AUTO_EXCLUDED_PFC_DETAILED = ['LOAN_PAYMENTS_CREDIT_CARD_PAYMENT'];
 
+// Carved out of the TRANSFER_OUT exclusion above - Plaid's own TRANSFER_IN/TRANSFER_OUT
+// primary category lumps a genuine self-account transfer (checking -> savings) together
+// with a peer-to-peer app payment (Venmo, Cash App, PayPal, Zelle), but paying a friend
+// back for dinner is real spending, not moving your own money around. Plaid's detailed
+// value is what actually distinguishes the two (confirmed live against real transaction
+// data - a Venmo payment came back as pfc_primary: TRANSFER_OUT, pfc_detailed:
+// TRANSFER_OUT_TRANSFER_OUT_FROM_APPS; a real self-transfer wouldn't carry that detailed
+// value). Only the outflow side needs this - the inflow side (someone paying you back)
+// still never counts toward spend either way, same as any other negative-amount
+// transaction, it's just categorized differently for display (see categorizeExpenses in
+// api.js on the frontend).
+const PFC_DETAILED_P2P_OUT = 'TRANSFER_OUT_TRANSFER_OUT_FROM_APPS';
+
 // Read-only view of what's actually in our database now, for testing/verification.
 app.get('/api/transactions', async (req, res) => {
   try {
@@ -830,6 +843,7 @@ app.get('/api/transactions', async (req, res) => {
            CASE
              WHEN t.amount <= 0 THEN true
              WHEN t.user_excluded IS NOT NULL THEN t.user_excluded
+             WHEN t.pfc_detailed = $6 THEN false
              ELSE (
                COALESCE(t.pfc_primary, '') = ANY($3) OR COALESCE(t.pfc_detailed, '') = ANY($4)
                OR t.is_recurring_bill
@@ -838,7 +852,7 @@ app.get('/api/transactions', async (req, res) => {
          FROM transactions t
          WHERE t.user_id = $1 AND t.date BETWEEN $2 AND $5
          ORDER BY t.date DESC, t.id`,
-        [userId, rangeStart, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, rangeEnd]
+        [userId, rangeStart, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, rangeEnd, PFC_DETAILED_P2P_OUT]
       );
       return res.json(result.rows);
     }
@@ -1158,8 +1172,13 @@ const COUNTS_TOWARD_SPEND = `
       OR (
         t.user_excluded IS NULL
         AND t.is_recurring_bill = false
-        AND COALESCE(t.pfc_primary, '') != ALL($4)
-        AND COALESCE(t.pfc_detailed, '') != ALL($5)
+        AND (
+          t.pfc_detailed = $6
+          OR (
+            COALESCE(t.pfc_primary, '') != ALL($4)
+            AND COALESCE(t.pfc_detailed, '') != ALL($5)
+          )
+        )
       )
     )
   )
@@ -1178,7 +1197,7 @@ app.get('/api/spend', async (req, res) => {
        WHERE t.user_id = $1
          AND t.date BETWEEN $2 AND $3
          AND ${COUNTS_TOWARD_SPEND}`,
-      [userId, start, end, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED]
+      [userId, start, end, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, PFC_DETAILED_P2P_OUT]
     );
 
     const manualResult = await pool.query(
@@ -1220,7 +1239,7 @@ app.get('/api/spend/daily', async (req, res) => {
          GROUP BY local_date
        ) m ON m.local_date = gs::date
        ORDER BY gs`,
-      [userId, start, end, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED]
+      [userId, start, end, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, PFC_DETAILED_P2P_OUT]
     );
 
     res.json(result.rows.map((r) => ({ date: toDateOnly(r.date), spent: Number(r.spent) })));
