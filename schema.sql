@@ -39,6 +39,11 @@ CREATE TABLE IF NOT EXISTS mfa_backup_codes (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Postgres doesn't auto-index a foreign key column the way it does PRIMARY KEY/UNIQUE
+-- ones - auth.js queries this table by user_id directly (checking/consuming backup codes,
+-- clearing them on MFA disable/regenerate), which was a full table scan without this.
+CREATE INDEX IF NOT EXISTS idx_mfa_backup_codes_user ON mfa_backup_codes(user_id);
+
 -- Emailed 6-digit codes for "forgot password" - same hashed-at-rest, single-use shape as
 -- mfa_backup_codes above, plus expires_at since unlike a backup code (valid until spent),
 -- a reset code that's never used should stop being usable after a short window rather
@@ -54,6 +59,8 @@ CREATE TABLE IF NOT EXISTS password_reset_codes (
   used_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Queried by user_id every time a reset code is requested or checked.
+CREATE INDEX IF NOT EXISTS idx_password_reset_codes_user ON password_reset_codes(user_id);
 -- Superseded by a per-transaction override (transactions.user_excluded, tri-state) - a
 -- single global toggle plus a separate per-bill flag couldn't actually let someone include
 -- one specific transaction (a bill that's secretly a transfer, a refund, etc.), which was
@@ -81,6 +88,10 @@ ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ NOT NULL 
 -- (or Apple Sign-In) and a correct MFA code, for an account with MFA turned on - requireAuth
 -- rejects a session in this state for every route except the one that verifies the code.
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS mfa_verified BOOLEAN NOT NULL DEFAULT true;
+-- token's own UNIQUE constraint already indexes the requireAuth lookup path (every
+-- authenticated request). This is for the separate by-user queries - invalidating every
+-- other session on a password change, and clearing all of a user's sessions on delete.
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 
 -- One row per bank connection (a Plaid "Item"). A user can have up to 5 per the spec.
 CREATE TABLE IF NOT EXISTS plaid_items (
@@ -108,6 +119,10 @@ ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ;
 -- which is just a display string. Used to detect a user re-linking a bank they already
 -- have connected, per Plaid's own duplicate-Item prevention guidance.
 ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS institution_id TEXT;
+-- Queried by user_id directly on essentially every app load (getPlaidItems), plus
+-- sync_transactions and account deletion - same missing-FK-index gap as the other tables
+-- indexed below.
+CREATE INDEX IF NOT EXISTS idx_plaid_items_user ON plaid_items(user_id);
 
 -- Cached copy of transactions pulled from Plaid via /transactions/sync.
 CREATE TABLE IF NOT EXISTS transactions (
@@ -194,6 +209,8 @@ ALTER TABLE recurring_bills ADD COLUMN IF NOT EXISTS user_included BOOLEAN NOT N
 -- is_recurring_bill during /api/sync_recurring), so per-bill inclusion choices can be
 -- applied when computing spend.
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS recurring_bill_id INTEGER REFERENCES recurring_bills(id);
+-- Queried by user_id directly every time the Bills tab loads.
+CREATE INDEX IF NOT EXISTS idx_recurring_bills_user ON recurring_bills(user_id);
 
 -- One budget per user. monthly_amount is divided by days-in-month client-side
 -- (the client knows the device's local timezone/date; the server intentionally doesn't).
@@ -243,3 +260,7 @@ CREATE TABLE IF NOT EXISTS webhook_log (
 -- message, or 'NO_MATCHING_ITEM' if the webhook's item_id didn't match anything in
 -- plaid_items. Not filled in for webhook types/codes that don't trigger a sync at all.
 ALTER TABLE webhook_log ADD COLUMN IF NOT EXISTS sync_error TEXT;
+-- Not a foreign key (see this table's own comment above - a webhook can arrive for an item
+-- already deleted our side), but still queried by item_id on account/bank deletion cleanup,
+-- and this table has no retention policy - it only grows, unlike the others indexed here.
+CREATE INDEX IF NOT EXISTS idx_webhook_log_item ON webhook_log(item_id);
