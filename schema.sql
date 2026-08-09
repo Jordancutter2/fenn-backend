@@ -211,6 +211,9 @@ ALTER TABLE recurring_bills ADD COLUMN IF NOT EXISTS user_included BOOLEAN NOT N
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS recurring_bill_id INTEGER REFERENCES recurring_bills(id);
 -- Queried by user_id directly every time the Bills tab loads.
 CREATE INDEX IF NOT EXISTS idx_recurring_bills_user ON recurring_bills(user_id);
+-- PATCH /api/bills/:id/include updates every transaction linked to a bill by this column -
+-- unlike every other foreign key on this table, it had no index of its own to serve that.
+CREATE INDEX IF NOT EXISTS idx_transactions_recurring_bill ON transactions(recurring_bill_id);
 
 -- One budget per user. monthly_amount is divided by days-in-month client-side
 -- (the client knows the device's local timezone/date; the server intentionally doesn't).

@@ -839,14 +839,24 @@ app.get('/api/transactions', async (req, res) => {
         // as a full ISO timestamp shifted by the server's local timezone (e.g.
         // "2026-07-13T06:00:00.000Z" for Mountain Time), not the plain "2026-07-13" every
         // date-string helper in the app (parseDateKey, etc.) expects.
+        // This CASE must stay in exact lockstep with COUNTS_TOWARD_SPEND below (same
+        // predicate, just inverted) - they drifted once already: a recurring P2P payment
+        // (is_recurring_bill=true, pfc_detailed=P2P_OUT - a monthly Venmo rent-split, say)
+        // came back excluded=false here (unconditionally not-excluded for any P2P_OUT
+        // transaction, regardless of is_recurring_bill) while COUNTS_TOWARD_SPEND already
+        // required is_recurring_bill=false before treating a P2P_OUT transaction as
+        // counted - so the itemized list showed it as a normal counted expense while the
+        // total silently didn't include it. is_recurring_bill is now checked before the
+        // P2P_OUT carve-out, not folded into the fallback ELSE after it, so a recurring
+        // P2P payment is excluded by default same as any other recurring bill.
         `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pending, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill,
            CASE
              WHEN t.amount <= 0 THEN true
              WHEN t.user_excluded IS NOT NULL THEN t.user_excluded
+             WHEN t.is_recurring_bill THEN true
              WHEN t.pfc_detailed = $6 THEN false
              ELSE (
                COALESCE(t.pfc_primary, '') = ANY($3) OR COALESCE(t.pfc_detailed, '') = ANY($4)
-               OR t.is_recurring_bill
              )
            END AS excluded
          FROM transactions t
@@ -858,7 +868,11 @@ app.get('/api/transactions', async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT id, date, name, merchant_name, amount, pending, pfc_primary, pfc_detailed, user_excluded
+      // to_char, not a bare column - same reasoning as the ranged branch above (a raw
+      // DATE column serializes as a full ISO timestamp, not the plain 'YYYY-MM-DD' every
+      // date-string helper in the app expects). This fallback branch (no date/start/end
+      // query params) had been missed when that fix was made for the ranged branch.
+      `SELECT id, to_char(date, 'YYYY-MM-DD') AS date, name, merchant_name, amount, pending, pfc_primary, pfc_detailed, user_excluded
        FROM transactions WHERE user_id = $1 ORDER BY date DESC LIMIT 100`,
       [userId]
     );
@@ -1061,8 +1075,17 @@ app.get('/api/budget', async (req, res) => {
 app.post('/api/budget', async (req, res) => {
   try {
     const { monthly_amount, week_start_day } = req.body;
-    if (!monthly_amount || monthly_amount <= 0) {
+    // Number(), not the raw body value - `!monthly_amount || monthly_amount <= 0` alone
+    // only catches falsy/negative numbers, not a non-numeric string ("abc" <= 0 is false
+    // in JS, so it passed straight through to Postgres and surfaced as a generic 500
+    // instead of a clean 400).
+    const amount = Number(monthly_amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: 'monthly_amount must be a positive number' });
+    }
+    const weekStartDay = week_start_day ?? 0;
+    if (!Number.isInteger(weekStartDay) || weekStartDay < 0 || weekStartDay > 6) {
+      return res.status(400).json({ error: 'week_start_day must be an integer 0-6' });
     }
     const userId = req.userId;
     await pool.query(
@@ -1072,7 +1095,7 @@ app.post('/api/budget', async (req, res) => {
          monthly_amount = EXCLUDED.monthly_amount,
          week_start_day = EXCLUDED.week_start_day,
          updated_at = now()`,
-      [userId, monthly_amount, week_start_day ?? 0]
+      [userId, amount, weekStartDay]
     );
     res.json({ ok: true });
   } catch (err) {
@@ -1104,8 +1127,11 @@ app.get('/api/expenses', async (req, res) => {
 
 app.post('/api/expenses', async (req, res) => {
   try {
-    const { amount, note, local_date, occurred_at } = req.body;
-    if (!amount || amount <= 0) {
+    const { amount: rawAmount, note, local_date, occurred_at } = req.body;
+    // Number(), not the raw body value - see the same fix on POST /api/budget above for
+    // why (a non-numeric string slipped past the old `!amount || amount <= 0` check).
+    const amount = Number(rawAmount);
+    if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: 'amount must be a positive number' });
     }
     if (!local_date) {
@@ -1113,9 +1139,13 @@ app.post('/api/expenses', async (req, res) => {
     }
     const userId = req.userId;
     const result = await pool.query(
+      // to_char on the RETURNING clause too, not just GET /api/expenses's own SELECT -
+      // local_date is the same raw DATE column either way, so without this the response
+      // right after logging an expense carried a malformed date (a full ISO timestamp
+      // instead of 'YYYY-MM-DD') until the next GET refetch corrected it.
       `INSERT INTO manual_expenses (user_id, amount, note, local_date, occurred_at)
        VALUES ($1, $2, $3, $4, COALESCE($5, now()))
-       RETURNING id, amount, note, local_date, occurred_at`,
+       RETURNING id, amount, note, to_char(local_date, 'YYYY-MM-DD') AS local_date, occurred_at`,
       [userId, amount, note || null, local_date, occurred_at || null]
     );
     res.json(result.rows[0]);
@@ -1192,19 +1222,22 @@ app.get('/api/spend', async (req, res) => {
     }
     const userId = req.userId;
 
-    const plaidResult = await pool.query(
-      `SELECT COALESCE(SUM(t.amount), 0) AS total FROM transactions t
-       WHERE t.user_id = $1
-         AND t.date BETWEEN $2 AND $3
-         AND ${COUNTS_TOWARD_SPEND}`,
-      [userId, start, end, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, PFC_DETAILED_P2P_OUT]
-    );
-
-    const manualResult = await pool.query(
-      `SELECT COALESCE(SUM(amount), 0) AS total FROM manual_expenses
-       WHERE user_id = $1 AND local_date BETWEEN $2 AND $3`,
-      [userId, start, end]
-    );
+    // Independent queries (Plaid-synced transactions vs. manual expenses, different
+    // tables) - run together instead of one after another.
+    const [plaidResult, manualResult] = await Promise.all([
+      pool.query(
+        `SELECT COALESCE(SUM(t.amount), 0) AS total FROM transactions t
+         WHERE t.user_id = $1
+           AND t.date BETWEEN $2 AND $3
+           AND ${COUNTS_TOWARD_SPEND}`,
+        [userId, start, end, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, PFC_DETAILED_P2P_OUT]
+      ),
+      pool.query(
+        `SELECT COALESCE(SUM(amount), 0) AS total FROM manual_expenses
+         WHERE user_id = $1 AND local_date BETWEEN $2 AND $3`,
+        [userId, start, end]
+      ),
+    ]);
 
     const total = Number(plaidResult.rows[0].total) + Number(manualResult.rows[0].total);
     res.json({ start, end, spent: total });
@@ -1269,6 +1302,20 @@ app.get('/api/spend/earliest-date', async (req, res) => {
     console.error(err);
     res.status(500).json({ error: 'Failed to compute earliest date' });
   }
+});
+
+// Every route above wraps its own body in try/catch and returns a JSON error - this is
+// the fallback for anything that gets thrown outside of one of those (most notably
+// requireAuth/requirePaidTier, which run before a route's own try/catch even starts).
+// Without this, Express's default error handler takes over: an HTML error page instead
+// of JSON (breaking every client call site's `res.json()`/error-shape assumptions), and
+// - whenever NODE_ENV isn't explicitly 'production' - a stack trace in the response body.
+// Must be registered last, after every route, and keep all four (err, req, res, next)
+// params - that arity is what tells Express this is an error handler rather than a
+// regular middleware.
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: 'Internal error' });
 });
 
 const PORT = process.env.PORT || 8000;
