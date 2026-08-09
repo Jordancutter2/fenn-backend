@@ -72,9 +72,10 @@ revised as the team grows.
   flags for a targeted item.
 - Standard HTTP security headers (baseline CSP, X-Content-Type-Options,
   HSTS, and others) are set on every response via `helmet`.
-- Crash/error reporting (Sentry) is configured to minimize collected user
-  data: default PII collection (IP address) is disabled, and optional
-  features that would capture UI content (Session Replay) are not enabled.
+- Crash/error reporting (Sentry, on the iOS client only - not integrated into
+  this backend) is configured to minimize collected user data: default PII
+  collection (IP address) is disabled, and optional features that would
+  capture UI content (Session Replay) are not enabled.
 
 ### Vulnerability management and patch SLA
 - GitHub Dependabot alerts, security updates, and malware alerts are enabled
