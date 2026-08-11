@@ -150,8 +150,13 @@ async function changePassword(userId, currentPassword, newPassword, currentSessi
   const user = result.rows[0];
 
   if (!user || !user.password_hash || !(await bcrypt.compare(currentPassword, user.password_hash))) {
+    // A precise, machine-checkable signal (not just the message string) - the frontend
+    // uses this to tell "the server genuinely checked and the password was wrong" apart
+    // from a network failure/timeout, where it's ambiguous whether this request actually
+    // landed before the connection dropped (the change could have already gone through).
     const err = new Error('Current password is incorrect.');
     err.status = 401;
+    err.code = 'WRONG_CURRENT_PASSWORD';
     throw err;
   }
 

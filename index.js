@@ -247,7 +247,9 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
     await changePassword(req.userId, current_password, new_password, currentSessionToken);
     res.json({ ok: true });
   } catch (err) {
-    res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to change password' });
+    res
+      .status(err.status || 500)
+      .json({ error: err.status ? err.message : 'Failed to change password', code: err.code });
   }
 });
 
@@ -316,13 +318,24 @@ app.delete('/api/account', requireAuth, async (req, res) => {
     const items = await pool.query('SELECT access_token, plaid_item_id FROM plaid_items WHERE user_id = $1', [
       req.userId,
     ]);
-    for (const item of items.rows) {
-      try {
-        await plaidClient.itemRemove({ access_token: decryptToken(item.access_token) });
-      } catch (err) {
-        console.error(`itemRemove failed for item ${item.plaid_item_id}:`, err.response ? err.response.data : err);
-      }
-    }
+    // Parallel, not sequential - this used to await each bank's itemRemove one at a time,
+    // so someone with several linked banks and one slow Plaid response could push the
+    // whole request past the client's timeout. The client would then show "failed, try
+    // again" while this handler kept running server-side and actually finished deleting
+    // the account - a retry then hit a dead session and got silently bounced to login,
+    // with no confirmation the deletion (which the "failed" message told them didn't
+    // happen) had, in fact, already happened. allSettled, not all - one bank's itemRemove
+    // failing must not stop the others or block account deletion itself, same isolation
+    // the original sequential loop already had per-item.
+    await Promise.allSettled(
+      items.rows.map((item) =>
+        plaidClient
+          .itemRemove({ access_token: decryptToken(item.access_token) })
+          .catch((err) =>
+            console.error(`itemRemove failed for item ${item.plaid_item_id}:`, err.response ? err.response.data : err)
+          )
+      )
+    );
     if (items.rows.length > 0) {
       await pool.query('DELETE FROM webhook_log WHERE item_id = ANY($1)', [items.rows.map((i) => i.plaid_item_id)]);
     }
