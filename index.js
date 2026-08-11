@@ -752,8 +752,12 @@ async function syncOneItem(item, userId) {
 app.post('/api/sync_transactions', async (req, res) => {
   try {
     const userId = req.userId;
+    // Excludes items already flagged needs_reconnect - a broken Item's access_token is
+    // guaranteed to fail with ITEM_LOGIN_REQUIRED until the user completes the reconnect
+    // flow, so calling Plaid for it again on every sync (every session, every 10-minute
+    // gate refresh, every pull-to-refresh) was a real, indefinitely-repeating wasted call.
     const items = await pool.query(
-      'SELECT id, plaid_item_id, access_token, cursor, created_at FROM plaid_items WHERE user_id = $1',
+      'SELECT id, plaid_item_id, access_token, cursor, created_at FROM plaid_items WHERE user_id = $1 AND needs_reconnect = false',
       [userId]
     );
 
@@ -903,9 +907,12 @@ app.get('/api/plaid_items', async (req, res) => {
 app.post('/api/sync_recurring', async (req, res) => {
   try {
     const userId = req.userId;
-    const items = await pool.query('SELECT id, plaid_item_id, access_token FROM plaid_items WHERE user_id = $1', [
-      userId,
-    ]);
+    // Same needs_reconnect exclusion as sync_transactions - a broken Item is guaranteed to
+    // fail here too until reconnected.
+    const items = await pool.query(
+      'SELECT id, plaid_item_id, access_token FROM plaid_items WHERE user_id = $1 AND needs_reconnect = false',
+      [userId]
+    );
 
     for (const item of items.rows) {
       // Same per-item isolation as sync_transactions - one bad connection shouldn't block
