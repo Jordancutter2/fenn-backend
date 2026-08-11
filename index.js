@@ -1104,6 +1104,101 @@ app.post('/api/budget', async (req, res) => {
   }
 });
 
+// One savings goal per user - see schema.sql for why progress isn't stored here (it's
+// derived client-side from daily spend history since started_at).
+const GOAL_NAME_MAX_LENGTH = 60;
+
+function parseGoalFields(body) {
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  if (!name || name.length > GOAL_NAME_MAX_LENGTH) {
+    return { error: `name must be 1-${GOAL_NAME_MAX_LENGTH} characters` };
+  }
+  const targetAmount = Number(body.target_amount);
+  if (!Number.isFinite(targetAmount) || targetAmount <= 0) {
+    return { error: 'target_amount must be a positive number' };
+  }
+  let targetDate = null;
+  if (body.target_date != null) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(body.target_date) || Number.isNaN(new Date(body.target_date).getTime())) {
+      return { error: 'target_date must be a valid YYYY-MM-DD date' };
+    }
+    targetDate = body.target_date;
+  }
+  return { name, targetAmount, targetDate };
+}
+
+app.get('/api/savings-goal', async (req, res) => {
+  try {
+    const userId = req.userId;
+    const result = await pool.query(
+      `SELECT name, target_amount, to_char(target_date, 'YYYY-MM-DD') AS target_date, started_at
+       FROM savings_goals WHERE user_id = $1`,
+      [userId]
+    );
+    res.json(result.rows[0] || null);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch savings goal' });
+  }
+});
+
+// Starts fresh: resets started_at to now, so progress (computed client-side from history
+// since started_at) begins at zero. Used both for a first-time goal and for explicitly
+// starting over/replacing an existing one.
+app.post('/api/savings-goal', async (req, res) => {
+  try {
+    const parsed = parseGoalFields(req.body);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    const userId = req.userId;
+    await pool.query(
+      `INSERT INTO savings_goals (user_id, name, target_amount, target_date, started_at, updated_at)
+       VALUES ($1, $2, $3, $4, now(), now())
+       ON CONFLICT (user_id) DO UPDATE SET
+         name = EXCLUDED.name,
+         target_amount = EXCLUDED.target_amount,
+         target_date = EXCLUDED.target_date,
+         started_at = now(),
+         updated_at = now()`,
+      [userId, parsed.name, parsed.targetAmount, parsed.targetDate]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to save savings goal' });
+  }
+});
+
+// Edits in place - unlike POST above, started_at is deliberately left untouched so
+// changing the target or deadline doesn't reset progress already made toward it.
+app.patch('/api/savings-goal', async (req, res) => {
+  try {
+    const parsed = parseGoalFields(req.body);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    const userId = req.userId;
+    const result = await pool.query(
+      `UPDATE savings_goals SET name = $2, target_amount = $3, target_date = $4, updated_at = now()
+       WHERE user_id = $1`,
+      [userId, parsed.name, parsed.targetAmount, parsed.targetDate]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: 'No savings goal to update' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update savings goal' });
+  }
+});
+
+app.delete('/api/savings-goal', async (req, res) => {
+  try {
+    const userId = req.userId;
+    await pool.query('DELETE FROM savings_goals WHERE user_id = $1', [userId]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete savings goal' });
+  }
+});
+
 app.get('/api/expenses', async (req, res) => {
   try {
     const { date, start, end } = req.query;

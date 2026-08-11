@@ -224,6 +224,20 @@ CREATE TABLE IF NOT EXISTS budgets (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- One goal per user, same one-row shape as budgets. Progress isn't stored here - it's
+-- computed client-side from daily spend history since started_at (cumulative
+-- budget-minus-spent), the same way streaks are computed from history rather than
+-- persisted. started_at resets to now() on a fresh POST (starting over); PATCH (editing
+-- name/target/date in place) deliberately leaves it untouched so progress isn't lost.
+CREATE TABLE IF NOT EXISTS savings_goals (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  target_amount NUMERIC(12, 2) NOT NULL,
+  target_date DATE, -- nullable: no deadline means progress is shown against a projected pace instead
+  started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- Manually-entered expenses (free tier, or any user logging something not from a linked bank).
 -- Unlike Plaid transactions these can be freely edited/deleted since they're not tied to a bank record.
 --
