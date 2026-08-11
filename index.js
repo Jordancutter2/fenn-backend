@@ -100,12 +100,30 @@ app.get('/terms', (req, res) => {
 // capping how many guesses an attacker gets - without this, nothing stops a sustained
 // brute-force run against a specific email over hours. Keyed by IP, not by email, so it
 // can't be used to lock a real user out by deliberately failing their login from elsewhere.
-const authLimiter = rateLimit({
+//
+// Two tiers, not one shared bucket across every auth route - a single 10-per-15-min limit
+// covering login, register, Apple sign-in, password-reset request, password-reset submit,
+// AND MFA verify all at once meant a normal (non-malicious) user who mistyped a password a
+// couple of times, tapped "Forgot password," resent the code once, and fumbled an MFA
+// entry could realistically hit the cap within minutes and get locked out of every one of
+// those actions for 15 minutes - including the ones needed to actually get back in. Only
+// login and MFA verify are genuinely guessable-secret endpoints where tight brute-force
+// protection matters; the others don't get meaningfully weaker with more headroom (you
+// can't brute-force your way into registering someone else's email, and a password reset
+// still requires a real code that was emailed to the account's actual owner).
+const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 10,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many attempts. Try again later.' },
+  message: { error: 'Too many attempts. Try again in a few minutes.' },
+});
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts. Try again in a few minutes.' },
 });
 
 // node-postgres parses DATE columns into JS Date objects using the *local* timezone of
@@ -139,7 +157,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', authLimiter, async (req, res) => {
+app.post('/api/auth/login', loginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
@@ -274,7 +292,7 @@ app.post('/api/auth/mfa/disable', requireAuth, async (req, res) => {
 // mfa_verified=false at this point, which requireAuth would reject. The token is supplied
 // explicitly in the body (not the Authorization header) for the same reason: the app
 // shouldn't persist this token as "the" session until this call actually succeeds.
-app.post('/api/auth/mfa/verify-login', authLimiter, async (req, res) => {
+app.post('/api/auth/mfa/verify-login', loginLimiter, async (req, res) => {
   try {
     const { token, code } = req.body;
     if (!token || !code) return res.status(400).json({ error: 'Token and code are required.' });
@@ -653,12 +671,25 @@ app.post('/api/exchange_public_token', requirePaidTier, async (req, res) => {
 
     const response = await plaidClient.itemPublicTokenExchange({ public_token });
 
-    await pool.query(
-      `INSERT INTO plaid_items (user_id, plaid_item_id, access_token, institution_name, institution_id)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (plaid_item_id) DO UPDATE SET access_token = EXCLUDED.access_token`,
-      [userId, response.data.item_id, encryptToken(response.data.access_token), institution_name || null, institution_id || null]
-    );
+    try {
+      await pool.query(
+        `INSERT INTO plaid_items (user_id, plaid_item_id, access_token, institution_name, institution_id)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (plaid_item_id) DO UPDATE SET access_token = EXCLUDED.access_token`,
+        [userId, response.data.item_id, encryptToken(response.data.access_token), institution_name || null, institution_id || null]
+      );
+    } catch (insertErr) {
+      // idx_plaid_items_user_institution (schema.sql) - the real backstop for the race the
+      // pre-check above can't fully close (a real Plaid network call sits between the
+      // SELECT and this INSERT). The pre-check already covers the common case cheaply;
+      // this only matters for the rare overlap, where it's the difference between a clean
+      // "already connected" message and two rows silently double-counting the same bank's
+      // spend going forward.
+      if (insertErr.code === '23505') {
+        return res.status(409).json({ error: 'You already have this bank connected.' });
+      }
+      throw insertErr;
+    }
 
     res.json({ item_id: response.data.item_id });
   } catch (err) {

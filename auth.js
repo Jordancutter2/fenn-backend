@@ -81,11 +81,26 @@ async function register({ email, password, marketingConsent }) {
   }
 
   const passwordHash = await bcrypt.hash(password, 10);
-  const result = await pool.query(
-    `INSERT INTO users (email, password_hash, tos_accepted_at, marketing_consent)
-     VALUES ($1, $2, now(), $3) RETURNING id, email, tier, created_at`,
-    [email, passwordHash, !!marketingConsent]
-  );
+  let result;
+  try {
+    result = await pool.query(
+      `INSERT INTO users (email, password_hash, tos_accepted_at, marketing_consent)
+       VALUES ($1, $2, now(), $3) RETURNING id, email, tier, created_at`,
+      [email, passwordHash, !!marketingConsent]
+    );
+  } catch (insertErr) {
+    // The SELECT above only catches the common case - bcrypt.hash takes real time (10
+    // rounds), long enough for two overlapping register requests (a double-tap, a client
+    // timeout-then-retry) to both pass that check before either INSERT commits. Without
+    // this, the loser hit the generic "Failed to register" 500 instead of the same clean
+    // "already exists" message the pre-check gives everyone else.
+    if (insertErr.code === '23505') {
+      const err = new Error('An account with that email already exists.');
+      err.status = 409;
+      throw err;
+    }
+    throw insertErr;
+  }
   const user = result.rows[0];
   const token = await createSession(user.id);
   return { token, user };
@@ -279,7 +294,15 @@ async function loginWithApple({ identityToken, email: emailFromClient, marketing
   }
 
   if (!email) {
-    const err = new Error('Apple did not provide an email for this sign-in.');
+    // Apple only ever discloses the real email on the very first authorization for this
+    // bundle ID, ever - independent of Fenn's own DB state. A user who deletes their Fenn
+    // account and later tries to sign back in with the same Apple ID has already "used"
+    // that one-time disclosure, so this isn't recoverable by simply retrying - the message
+    // has to point at the actual fix (Apple's own re-authorization reset) or an alternate
+    // path in, or this is a permanent dead end for that person.
+    const err = new Error(
+      "Apple didn't share an email for this sign-in - this can happen if you've signed into Fenn with this Apple ID before. Try email/password instead, or on your device go to Settings > [your name] > Sign in with Apple > Fenn and remove it, then try Apple sign-in again."
+    );
     err.status = 400;
     throw err;
   }
@@ -289,11 +312,27 @@ async function loginWithApple({ identityToken, email: emailFromClient, marketing
     throw err;
   }
 
-  const insertResult = await pool.query(
-    `INSERT INTO users (email, apple_user_id, tos_accepted_at, marketing_consent)
-     VALUES ($1, $2, now(), $3) RETURNING id, email, tier, created_at`,
-    [email, appleUserId, !!marketingConsent]
-  );
+  let insertResult;
+  try {
+    insertResult = await pool.query(
+      `INSERT INTO users (email, apple_user_id, tos_accepted_at, marketing_consent)
+       VALUES ($1, $2, now(), $3) RETURNING id, email, tier, created_at`,
+      [email, appleUserId, !!marketingConsent]
+    );
+  } catch (insertErr) {
+    // Same overlapping-request race as register() above, just harder to trigger here
+    // (Apple's own native sheet largely serializes the flow) - both apple_user_id and
+    // email are UNIQUE, so a genuine double-submit lands here rather than creating two
+    // rows. The account this collided with was just created by the other request a
+    // moment ago, so asking for a retry (which will now hit the apple_user_id lookup at
+    // the top of this function and log them in) is correct, not just a generic failure.
+    if (insertErr.code === '23505') {
+      const err = new Error('Something else was signing you in - try again.');
+      err.status = 409;
+      throw err;
+    }
+    throw insertErr;
+  }
   const user = insertResult.rows[0];
   const token = await createSession(user.id);
   return { token, user };
@@ -447,14 +486,21 @@ const SESSION_REFRESH_THRESHOLD_DAYS = 1;
 async function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Not authenticated' });
+  // code: 'SESSION_INVALID' on these two specifically (not the mfaRequired one below,
+  // which is a normal, expected mid-login state, not a dead session) - a precise,
+  // machine-checkable signal the frontend uses to tell "this session token used to be
+  // valid and no longer is" apart from every OTHER 401 in the app that happens to share
+  // the same status code for an unrelated reason (a wrong current password on
+  // /api/auth/change-password, a wrong code on /api/auth/mfa/verify-login, a wrong
+  // password on /api/auth/login itself) - none of which should force a logout.
+  if (!token) return res.status(401).json({ error: 'Not authenticated', code: 'SESSION_INVALID' });
 
   const result = await pool.query(
     `SELECT user_id, mfa_verified FROM sessions
      WHERE token = $1 AND last_used_at > now() - interval '${SESSION_LIFETIME_DAYS} days'`,
     [token]
   );
-  if (result.rows.length === 0) return res.status(401).json({ error: 'Not authenticated' });
+  if (result.rows.length === 0) return res.status(401).json({ error: 'Not authenticated', code: 'SESSION_INVALID' });
 
   // A session created right after a correct password/Apple Sign-In for an MFA-enabled
   // account, but before the correct code - can't be used for anything else until then.

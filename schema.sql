@@ -123,6 +123,15 @@ ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS institution_id TEXT;
 -- sync_transactions and account deletion - same missing-FK-index gap as the other tables
 -- indexed below.
 CREATE INDEX IF NOT EXISTS idx_plaid_items_user ON plaid_items(user_id);
+-- Backstops /api/exchange_public_token's own duplicate-bank check, which only ran as a
+-- SELECT-then-later-INSERT with a real Plaid network round trip in between - not atomic,
+-- so two overlapping requests (a client timeout-then-retry, an impatient double-tap) could
+-- both pass the check and insert two rows for the same real bank, which would then get
+-- synced going forward and double-count every one of that bank's transactions in spend
+-- totals. A partial index (not a plain UNIQUE column) because institution_id can be null,
+-- and null values must stay unlimited - there's nothing to dedupe against without knowing
+-- which institution a connection is for.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plaid_items_user_institution ON plaid_items(user_id, institution_id) WHERE institution_id IS NOT NULL;
 
 -- Cached copy of transactions pulled from Plaid via /transactions/sync.
 CREATE TABLE IF NOT EXISTS transactions (
