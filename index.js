@@ -887,6 +887,53 @@ app.get('/api/transactions', async (req, res) => {
   }
 });
 
+// Searches merchant/transaction name and manual-expense notes, across a user's entire
+// history (not scoped to a date range like /api/transactions) - the whole point is finding
+// something you can't remember the date of. Same excluded CASE as /api/transactions above,
+// kept in exact lockstep for the same reason documented there - a result showing up
+// "included" here while /api/spend disagrees would be a confusing, silently-drifted bug.
+app.get('/api/search', async (req, res) => {
+  try {
+    const userId = req.userId;
+    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    if (q.length < 2) return res.json({ transactions: [], manual: [] });
+    const like = `%${q}%`;
+
+    const [txns, manual] = await Promise.all([
+      pool.query(
+        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill,
+           CASE
+             WHEN t.amount <= 0 THEN true
+             WHEN t.user_excluded IS NOT NULL THEN t.user_excluded
+             WHEN t.is_recurring_bill THEN true
+             WHEN t.pfc_detailed = $5 THEN false
+             ELSE (
+               COALESCE(t.pfc_primary, '') = ANY($3) OR COALESCE(t.pfc_detailed, '') = ANY($4)
+             )
+           END AS excluded
+         FROM transactions t
+         WHERE t.user_id = $1 AND (t.merchant_name ILIKE $2 OR t.name ILIKE $2)
+         ORDER BY t.date DESC, t.id
+         LIMIT 50`,
+        [userId, like, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, PFC_DETAILED_P2P_OUT]
+      ),
+      pool.query(
+        `SELECT id, amount, note, to_char(local_date, 'YYYY-MM-DD') AS local_date, occurred_at
+         FROM manual_expenses
+         WHERE user_id = $1 AND note ILIKE $2
+         ORDER BY occurred_at DESC
+         LIMIT 50`,
+        [userId, like]
+      ),
+    ]);
+
+    res.json({ transactions: txns.rows, manual: manual.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Search failed' });
+  }
+});
+
 app.get('/api/plaid_items', async (req, res) => {
   try {
     const userId = req.userId;
