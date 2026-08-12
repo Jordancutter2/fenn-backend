@@ -939,7 +939,12 @@ app.get('/api/transactions', async (req, res) => {
 app.get('/api/search', async (req, res) => {
   try {
     const userId = req.userId;
-    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    // Capped, not just trimmed - no merchant name or note is ever remotely this long, so
+    // anything past it is either accidental (paste) or someone poking at the endpoint, not
+    // a real search a user typed. Bound requests are already parameterized (safe from SQL
+    // injection either way), but there's no reason to run an ILIKE scan against an
+    // unbounded string.
+    const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 100) : '';
     if (q.length < 2) return res.json({ transactions: [], manual: [] });
     const like = `%${q}%`;
 
@@ -1176,18 +1181,27 @@ app.patch('/api/bills/:id/include', async (req, res) => {
   }
 });
 
-// Dismisses a pending price-increase alert - just clears previous_amount back to null,
-// same "was X, now Y" comparison a fresh sync would set it to again if the price goes up
-// a second time. WHERE ... AND user_id = $2 in the same statement, not a separate
-// existence check first - a bill that isn't this user's own simply matches zero rows and
-// no-ops, rather than needing its own 404 branch.
+// Dismisses a pending price-increase alert - clears previous_amount back to null, same
+// "was X, now Y" comparison a fresh sync would set it to again if the price goes up a
+// second time. WHERE ... AND user_id = $2 in the same statement, not a separate existence
+// check first - a bill that isn't this user's own simply matches zero rows and no-ops,
+// rather than needing its own 404 branch.
+//
+// AND previous_amount = $3 (the exact value the client is acknowledging, sent back in the
+// request body) is a compare-and-swap, not just an extra filter - without it, a sync
+// racing this same request (e.g. a pull-to-refresh mid-tap) that detects a brand-new
+// qualifying increase in between could have that fresh previous_amount silently clobbered
+// back to null by this blind clear, permanently losing visibility into an increase the
+// user never actually saw. If the stored value has already moved on by the time this
+// runs, the WHERE clause simply matches nothing - acknowledged: false tells the frontend
+// that happened, so it can reload instead of trusting its own optimistic clear.
 app.patch('/api/bills/:id/acknowledge_increase', async (req, res) => {
   try {
-    await pool.query('UPDATE recurring_bills SET previous_amount = NULL WHERE id = $1 AND user_id = $2', [
-      req.params.id,
-      req.userId,
-    ]);
-    res.json({ ok: true });
+    const result = await pool.query(
+      'UPDATE recurring_bills SET previous_amount = NULL WHERE id = $1 AND user_id = $2 AND previous_amount = $3 RETURNING id',
+      [req.params.id, req.userId, req.body.previous_amount]
+    );
+    res.json({ ok: true, acknowledged: result.rows.length > 0 });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to update bill' });
