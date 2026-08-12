@@ -1030,6 +1030,23 @@ app.post('/api/sync_recurring', async (req, res) => {
                is_active = EXCLUDED.is_active,
                pfc_primary = EXCLUDED.pfc_primary,
                pfc_detailed = EXCLUDED.pfc_detailed,
+               -- Records a price-increase alert when last_amount rose by at least $1 AND
+               -- at least 2% (GREATEST picks whichever floor is higher for this bill's own
+               -- size) - filters out cent-level noise from Plaid's own re-estimation on a
+               -- big bill (rent going from $2000.00 to $2001.13 isn't a real increase to
+               -- flag) while still catching a real jump on a small one (a $9.99
+               -- subscription needs only a ~$1 hike, not 2% of $2000, to qualify). Only
+               -- overwrites previous_amount when a NEW qualifying increase is seen this
+               -- sync - an already-pending, not-yet-acknowledged alert from an earlier
+               -- sync is left alone rather than silently cleared just because this
+               -- particular run didn't see a fresh jump.
+               previous_amount = CASE
+                 WHEN EXCLUDED.last_amount IS NOT NULL
+                  AND recurring_bills.last_amount IS NOT NULL
+                  AND EXCLUDED.last_amount - recurring_bills.last_amount >= GREATEST(1, recurring_bills.last_amount * 0.02)
+                 THEN recurring_bills.last_amount
+                 ELSE recurring_bills.previous_amount
+               END,
                updated_at = now()
              RETURNING id, user_included`,
             [
@@ -1102,7 +1119,7 @@ app.get('/api/bills', async (req, res) => {
       // parseDateKey splits on '-' expecting a plain 'YYYY-MM-DD' string - fed that ISO
       // string instead, it silently produces an Invalid Date (confirmed live: this was
       // showing "last Invalid Date - next ~Invalid Date" for every bill).
-      `SELECT rb.id, rb.merchant_name, rb.description, rb.average_amount, rb.last_amount, rb.frequency, to_char(rb.last_date, 'YYYY-MM-DD') AS last_date, rb.is_active, rb.user_included, rb.pfc_primary
+      `SELECT rb.id, rb.merchant_name, rb.description, rb.average_amount, rb.last_amount, rb.frequency, to_char(rb.last_date, 'YYYY-MM-DD') AS last_date, rb.is_active, rb.user_included, rb.pfc_primary, rb.previous_amount
        FROM recurring_bills rb
        JOIN plaid_items pi ON pi.id = rb.plaid_item_id
        WHERE rb.user_id = $1 AND rb.is_active = true AND rb.average_amount > 0
@@ -1152,6 +1169,24 @@ app.patch('/api/bills/:id/include', async (req, res) => {
       [included ? false : null, req.params.id, userId]
     );
 
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update bill' });
+  }
+});
+
+// Dismisses a pending price-increase alert - just clears previous_amount back to null,
+// same "was X, now Y" comparison a fresh sync would set it to again if the price goes up
+// a second time. WHERE ... AND user_id = $2 in the same statement, not a separate
+// existence check first - a bill that isn't this user's own simply matches zero rows and
+// no-ops, rather than needing its own 404 branch.
+app.patch('/api/bills/:id/acknowledge_increase', async (req, res) => {
+  try {
+    await pool.query('UPDATE recurring_bills SET previous_amount = NULL WHERE id = $1 AND user_id = $2', [
+      req.params.id,
+      req.userId,
+    ]);
     res.json({ ok: true });
   } catch (err) {
     console.error(err);

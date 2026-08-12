@@ -224,6 +224,16 @@ CREATE INDEX IF NOT EXISTS idx_recurring_bills_user ON recurring_bills(user_id);
 -- unlike every other foreign key on this table, it had no index of its own to serve that.
 CREATE INDEX IF NOT EXISTS idx_transactions_recurring_bill ON transactions(recurring_bill_id);
 
+-- Non-null only while there's a real, unacknowledged price increase to show on the Bills
+-- tab - holds what last_amount was immediately before the increase that's now pending, so
+-- the alert can say "was $X, now $Y" without a separate history table. Set by
+-- /api/sync_recurring when it detects last_amount rose meaningfully; cleared back to null
+-- by PATCH /api/bills/:id/acknowledge_increase once the user dismisses it. A second
+-- increase before the first is acknowledged just overwrites this with the latest jump
+-- (still just "was X, now Y", not a running history) - simpler, and matches what the user
+-- actually asked for.
+ALTER TABLE recurring_bills ADD COLUMN IF NOT EXISTS previous_amount NUMERIC(12, 2);
+
 -- One budget per user. monthly_amount is divided by days-in-month client-side
 -- (the client knows the device's local timezone/date; the server intentionally doesn't).
 CREATE TABLE IF NOT EXISTS budgets (
