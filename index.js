@@ -1332,6 +1332,22 @@ app.delete('/api/savings-goal', async (req, res) => {
   }
 });
 
+// Total, all-time count of manually-logged expenses - not scoped to any date range. Used
+// on the free tier to power a one-time "you've logged N expenses by hand" upgrade nudge
+// (see getManualExpenseCount/RingScreen.js) once someone has put in enough real, visible
+// effort that automatic bank-linked tracking is an obviously compelling trade. A plain
+// COUNT(*), not a route someone hits often - the frontend checks this at most once ever
+// per free-tier account (gated behind a SecureStore "already shown" flag).
+app.get('/api/expenses/count', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT COUNT(*) FROM manual_expenses WHERE user_id = $1', [req.userId]);
+    res.json({ count: Number(result.rows[0].count) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to count expenses' });
+  }
+});
+
 app.get('/api/expenses', async (req, res) => {
   try {
     const { date, start, end } = req.query;
