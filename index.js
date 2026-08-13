@@ -897,7 +897,7 @@ app.get('/api/transactions', async (req, res) => {
         // total silently didn't include it. is_recurring_bill is now checked before the
         // P2P_OUT carve-out, not folded into the fallback ELSE after it, so a recurring
         // P2P payment is excluded by default same as any other recurring bill.
-        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pending, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill,
+        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pending, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, pi.institution_name,
            CASE
              WHEN t.amount <= 0 THEN true
              WHEN t.user_excluded IS NOT NULL THEN t.user_excluded
@@ -908,6 +908,7 @@ app.get('/api/transactions', async (req, res) => {
              )
            END AS excluded
          FROM transactions t
+         JOIN plaid_items pi ON pi.id = t.plaid_item_id
          WHERE t.user_id = $1 AND t.date BETWEEN $2 AND $5
          ORDER BY t.date DESC, t.id`,
         [userId, rangeStart, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, rangeEnd, PFC_DETAILED_P2P_OUT]
@@ -950,7 +951,7 @@ app.get('/api/search', async (req, res) => {
 
     const [txns, manual] = await Promise.all([
       pool.query(
-        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill,
+        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, pi.institution_name,
            CASE
              WHEN t.amount <= 0 THEN true
              WHEN t.user_excluded IS NOT NULL THEN t.user_excluded
@@ -961,6 +962,7 @@ app.get('/api/search', async (req, res) => {
              )
            END AS excluded
          FROM transactions t
+         JOIN plaid_items pi ON pi.id = t.plaid_item_id
          WHERE t.user_id = $1 AND (t.merchant_name ILIKE $2 OR t.name ILIKE $2)
          ORDER BY t.date DESC, t.id
          LIMIT 50`,
