@@ -11,8 +11,21 @@ const { sendPasswordResetEmail } = require('./emailClient');
 const MFA_ISSUER = 'Fenn';
 const BACKUP_CODE_COUNT = 8;
 const RESET_CODE_EXPIRY_MS = 15 * 60 * 1000;
+// Generous enough for a real person fat-fingering their 6-digit code a couple of times,
+// tight enough to make a brute-force guess against its 900k-possibility keyspace
+// impractical within the code's lifetime regardless of how many source IPs it's spread
+// across (see the schema comment on password_reset_codes.attempts).
+const MAX_RESET_CODE_ATTEMPTS = 5;
 
 const MIN_PASSWORD_LENGTH = 8;
+
+// A hash with no real account or code behind it - compared against on every "no such
+// user"/"no such reset code" path below (login, resetPassword), so a nonexistent-account
+// request takes roughly the same wall-clock time as a real one. bcrypt.compare is the
+// dominant cost on these paths; JS's short-circuit && previously skipped it entirely when
+// no user/code was found, and that timing gap leaked account/code existence even though
+// both paths return the identical error message.
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync('fenn-timing-safety-dummy', 10);
 
 // Shared by register() and changePassword() - the only two places a password is ever set -
 // so a weak password can't slip in through either path. Length only, not composition
@@ -113,8 +126,12 @@ async function login({ email, password }) {
   );
   const user = result.rows[0];
 
-  // Same error for "no such user" and "wrong password" - don't reveal which one it was.
-  if (!user || !user.password_hash || !(await bcrypt.compare(password, user.password_hash))) {
+  // Always runs bcrypt.compare, even when no user (or no password_hash - an Apple-only
+  // account) exists, against DUMMY_PASSWORD_HASH in that case - see its own comment above
+  // for why. Same error for "no such user" and "wrong password" either way - don't reveal
+  // which one it was.
+  const passwordMatches = await bcrypt.compare(password, user?.password_hash || DUMMY_PASSWORD_HASH);
+  if (!user || !user.password_hash || !passwordMatches) {
     const err = new Error('Invalid email or password.');
     err.status = 401;
     throw err;
@@ -226,16 +243,32 @@ async function resetPassword({ email, code, newPassword }) {
     err.status = 400;
     throw err;
   };
-  if (!user) invalidCodeError();
 
+  // Always queries for a pending code and always runs bcrypt.compare, even when no user
+  // exists (user?.id ?? -1 - a placeholder that matches zero real rows) - same timing-
+  // safety reasoning as login() above (see DUMMY_PASSWORD_HASH's comment). This used to
+  // short-circuit straight to invalidCodeError() on !user, skipping both the second query
+  // and the bcrypt.compare entirely, which leaked account existence through response
+  // latency despite the identical error message.
   const codeResult = await pool.query(
-    `SELECT id, code_hash FROM password_reset_codes
+    `SELECT id, code_hash, attempts FROM password_reset_codes
      WHERE user_id = $1 AND used_at IS NULL AND expires_at > now()
      ORDER BY created_at DESC LIMIT 1`,
-    [user.id]
+    [user?.id ?? -1]
   );
   const resetRow = codeResult.rows[0];
-  if (!resetRow || !(await bcrypt.compare(code, resetRow.code_hash))) invalidCodeError();
+  const codeMatches = await bcrypt.compare(code, resetRow?.code_hash || DUMMY_PASSWORD_HASH);
+  // Once a code is exhausted it's dead even if this particular guess happened to be right -
+  // an IP-keyed rate limit alone doesn't stop a slow, patient guess spread across many
+  // source IPs against this one code's fixed 900k-possibility keyspace (see the schema
+  // comment on `attempts`), so the cap has to hold regardless of which guess lands.
+  const exhausted = resetRow && resetRow.attempts >= MAX_RESET_CODE_ATTEMPTS;
+  if (!user || !resetRow || !codeMatches || exhausted) {
+    if (resetRow && !exhausted) {
+      await pool.query('UPDATE password_reset_codes SET attempts = attempts + 1 WHERE id = $1', [resetRow.id]);
+    }
+    invalidCodeError();
+  }
 
   const newHash = await bcrypt.hash(newPassword, 10);
   await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, user.id]);

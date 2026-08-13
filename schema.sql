@@ -61,6 +61,11 @@ CREATE TABLE IF NOT EXISTS password_reset_codes (
 );
 -- Queried by user_id every time a reset code is requested or checked.
 CREATE INDEX IF NOT EXISTS idx_password_reset_codes_user ON password_reset_codes(user_id);
+-- Counts wrong guesses against this specific code. The IP-keyed rate limiter on
+-- /api/auth/reset-password doesn't stop a guess spread across many source IPs against one
+-- account's 6-digit code (900k possibilities, valid for RESET_CODE_EXPIRY_MS) - this caps
+-- how many wrong guesses one code tolerates regardless of where they came from.
+ALTER TABLE password_reset_codes ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;
 -- Superseded by a per-transaction override (transactions.user_excluded, tri-state) - a
 -- single global toggle plus a separate per-bill flag couldn't actually let someone include
 -- one specific transaction (a bill that's secretly a transfer, a refund, etc.), which was
@@ -119,6 +124,11 @@ ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ;
 -- which is just a display string. Used to detect a user re-linking a bank they already
 -- have connected, per Plaid's own duplicate-Item prevention guidance.
 ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS institution_id TEXT;
+-- Same purpose as last_synced_at above, but for /api/sync_recurring specifically - that
+-- route had no server-side debounce at all (only the client's own in-memory, resets-on-
+-- cold-start 10-minute gate), so a relaunch storm or two near-simultaneous requests could
+-- fire unbounded concurrent transactionsRecurringGet calls per item.
+ALTER TABLE plaid_items ADD COLUMN IF NOT EXISTS recurring_synced_at TIMESTAMPTZ;
 -- Queried by user_id directly on essentially every app load (getPlaidItems), plus
 -- sync_transactions and account deletion - same missing-FK-index gap as the other tables
 -- indexed below.

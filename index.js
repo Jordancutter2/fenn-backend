@@ -25,6 +25,35 @@ const {
 } = require('./auth');
 const { PRIVACY_POLICY, TERMS_OF_SERVICE } = require('./legalContent');
 
+// A real Plaid API error has err.response.data (safe - just Plaid's own error JSON). A
+// network-level failure (timeout, DNS, ECONNRESET, TLS) has no .response at all, and the
+// raw axios error object's own enumerable properties include `config` - which contains the
+// exact outgoing request body (an access_token, in plaintext, for every Plaid call in this
+// file) and `config.headers` (PLAID-SECRET, PLAID-CLIENT-ID, set globally in plaidClient.js).
+// console.error(err) on that error would print all of it. err.message is always safe -
+// every Plaid call site in this file must log through this, never the raw err or err.response.
+function plaidErrorDetail(err) {
+  return err.response?.data ? JSON.stringify(err.response.data) : err.message;
+}
+
+// Every date query param in this file (start/end/date on /api/transactions, /api/expenses,
+// /api/spend, /api/spend/daily) expects this exact shape - previously unvalidated, so a
+// malformed value (wrong format, or a syntactically-plausible-but-nonexistent date like
+// '2026-13-40') fell straight through to Postgres, which threw a type-cast error caught by
+// the generic handler and returned as a bare 500 instead of a clean 400. Same pattern
+// target_date already used for savings goals, pulled out here so every date param uses it.
+function isValidDateKey(value) {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(new Date(value).getTime());
+}
+
+// Express route params are always strings - a non-numeric :id (typo'd, or someone poking
+// at the endpoint) previously fell straight through to a parameterized query, which
+// Postgres rejects as a type-cast error on an INTEGER column, caught generically as a bare
+// 500 instead of a clean 400/404.
+function isValidId(value) {
+  return /^\d+$/.test(value);
+}
+
 const app = express();
 // Required for express-rate-limit (and req.ip generally) to see the real client IP rather
 // than one of Railway's own internal proxy hops - without this every request looks like
@@ -232,7 +261,11 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   res.json(result.rows[0] || null);
 });
 
-app.post('/api/auth/change-password', requireAuth, async (req, res) => {
+// loginLimiter, not authLimiter - this compares a real password via bcrypt, the same
+// "genuinely guessable-secret" category login/mfa-verify-login are already tightly limited
+// for (see the comment on loginLimiter above). A stolen/leaked session token would
+// otherwise let an attacker throw unlimited password guesses at this endpoint.
+app.post('/api/auth/change-password', requireAuth, loginLimiter, async (req, res) => {
   try {
     const { current_password, new_password } = req.body;
     if (!current_password || !new_password) {
@@ -278,7 +311,10 @@ app.post('/api/auth/mfa/confirm', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/auth/mfa/disable', requireAuth, async (req, res) => {
+// loginLimiter, same reasoning as change-password above - this also compares a real
+// password via bcrypt (disableMfa's own check), so it belongs in the tightly-limited tier
+// too, not left uncapped like the other requireAuth-only MFA routes above it.
+app.post('/api/auth/mfa/disable', requireAuth, loginLimiter, async (req, res) => {
   try {
     const { password } = req.body;
     if (!password) return res.status(400).json({ error: 'Password is required.' });
@@ -332,7 +368,16 @@ app.delete('/api/account', requireAuth, async (req, res) => {
         plaidClient
           .itemRemove({ access_token: decryptToken(item.access_token) })
           .catch((err) =>
-            console.error(`itemRemove failed for item ${item.plaid_item_id}:`, err.response ? err.response.data : err)
+            // Loud and greppable on purpose - once the account row below is deleted, this
+            // Item's access_token is gone for good (cascaded with it), so a failure here
+            // means it can never be cleaned up on Plaid's side again except by hand. No
+            // automatic retry queue exists yet (a deliberate call - this is a rare,
+            // transient-outage-only failure mode, not worth a new table + migration for
+            // pre-launch), so this line is the only record that it ever happened.
+            console.error(
+              `[ORPHANED PLAID ITEM] itemRemove failed during account deletion - user ${req.userId}, plaid_item_id ${item.plaid_item_id}. This Item is now unreachable from Fenn and needs manual cleanup on Plaid's dashboard:`,
+              plaidErrorDetail(err)
+            )
           )
       )
     );
@@ -497,7 +542,7 @@ app.post('/plaid-webhook', async (req, res) => {
         if (webhookLogId) await pool.query('UPDATE webhook_log SET sync_error = $1 WHERE id = $2', ['OK', webhookLogId]);
       }
     } catch (err) {
-      const message = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+      const message = plaidErrorDetail(err);
       console.error(`[plaid webhook] sync failed for item ${item_id}:`, message);
       if (webhookLogId) await pool.query('UPDATE webhook_log SET sync_error = $1 WHERE id = $2', [message, webhookLogId]);
     }
@@ -611,7 +656,7 @@ app.post('/api/create_link_token', requirePaidTier, async (req, res) => {
     });
     res.json({ link_token: response.data.link_token });
   } catch (err) {
-    console.error(err.response ? err.response.data : err);
+    console.error(plaidErrorDetail(err));
     res.status(500).json({ error: 'Failed to create link token' });
   }
 });
@@ -650,7 +695,13 @@ app.delete('/api/plaid_items/:id', async (req, res) => {
     try {
       await plaidClient.itemRemove({ access_token: decryptToken(item.rows[0].access_token) });
     } catch (err) {
-      console.error(`itemRemove failed for item ${item.rows[0].plaid_item_id}:`, err.response ? err.response.data : err);
+      // Same "loud, no retry queue" tradeoff as account deletion above - once the row
+      // below is gone, this Item's access_token is unrecoverable and needs manual
+      // cleanup on Plaid's dashboard if this ever fires.
+      console.error(
+        `[ORPHANED PLAID ITEM] itemRemove failed removing a single bank connection - user ${req.userId}, plaid_item_id ${item.rows[0].plaid_item_id}. This Item is now unreachable from Fenn and needs manual cleanup on Plaid's dashboard:`,
+        plaidErrorDetail(err)
+      );
     }
 
     await pool.query('DELETE FROM webhook_log WHERE item_id = $1', [item.rows[0].plaid_item_id]);
@@ -706,7 +757,7 @@ app.post('/api/exchange_public_token', requirePaidTier, async (req, res) => {
 
     res.json({ item_id: response.data.item_id });
   } catch (err) {
-    console.error(err.response ? err.response.data : err);
+    console.error(plaidErrorDetail(err));
     res.status(500).json({ error: 'Failed to exchange public token' });
   }
 });
@@ -801,7 +852,7 @@ app.post('/api/sync_transactions', async (req, res) => {
     // flow, so calling Plaid for it again on every sync (every session, every 10-minute
     // gate refresh, every pull-to-refresh) was a real, indefinitely-repeating wasted call.
     const items = await pool.query(
-      'SELECT id, plaid_item_id, access_token, cursor, created_at FROM plaid_items WHERE user_id = $1 AND needs_reconnect = false',
+      'SELECT id, plaid_item_id, access_token, cursor, created_at, last_synced_at FROM plaid_items WHERE user_id = $1 AND needs_reconnect = false',
       [userId]
     );
 
@@ -814,29 +865,51 @@ app.post('/api/sync_transactions', async (req, res) => {
     let totalRemoved = 0;
     const needsReconnect = [];
 
-    for (const item of items.rows) {
-      // One bank's connection breaking (expired login, MFA change, etc.) shouldn't stop
-      // the others from syncing - catch per-item so a single bad Item doesn't fail the
-      // whole request for someone with several banks connected.
-      try {
-        const counts = await syncOneItem(item, userId);
+    // Parallel, not sequential - same reasoning as account deletion's itemRemove fan-out
+    // above: with up to 5 banks and a first-time large historical backfill, syncing one at
+    // a time could push the whole request past the client's timeout. One bank's connection
+    // breaking (expired login, MFA change, etc.) still can't stop the others - each item's
+    // own try/catch below means this never rejects, only ever resolves with a per-item
+    // outcome, so allSettled is defensive rather than load-bearing here.
+    const results = await Promise.allSettled(
+      items.rows.map(async (item) => {
+        // Server-side debounce, not just the client's own 10-minute gate - that gate is a
+        // plain in-memory JS variable that resets on every cold start, and doesn't stop a
+        // second concurrent/rapid-fire request (a relaunch storm, a modified client, two
+        // tabs both becoming active within moments of each other) from reaching Plaid.
+        // Same debounce window and reasoning as the webhook handler's own guard.
+        const msSinceLastSync = item.last_synced_at ? Date.now() - new Date(item.last_synced_at).getTime() : Infinity;
+        if (msSinceLastSync < TRANSACTIONS_SYNC_DEBOUNCE_MS) {
+          return { item, counts: { added: 0, modified: 0, removed: 0 } };
+        }
+        try {
+          return { item, counts: await syncOneItem(item, userId) };
+        } catch (err) {
+          const errorCode = err.response?.data?.error_code;
+          if (errorCode === 'ITEM_LOGIN_REQUIRED') {
+            await pool.query('UPDATE plaid_items SET needs_reconnect = true WHERE id = $1', [item.id]);
+            return { item, needsReconnect: true };
+          }
+          console.error(`sync failed for item ${item.plaid_item_id}:`, plaidErrorDetail(err));
+          return { item, failed: true };
+        }
+      })
+    );
+
+    for (const r of results) {
+      if (r.status !== 'fulfilled') continue; // unreachable in practice - every path above resolves, never throws
+      const { counts, needsReconnect: nr, item } = r.value;
+      if (counts) {
         totalAdded += counts.added;
         totalModified += counts.modified;
         totalRemoved += counts.removed;
-      } catch (err) {
-        const errorCode = err.response?.data?.error_code;
-        if (errorCode === 'ITEM_LOGIN_REQUIRED') {
-          await pool.query('UPDATE plaid_items SET needs_reconnect = true WHERE id = $1', [item.id]);
-          needsReconnect.push(item.id);
-        } else {
-          console.error(`sync failed for item ${item.plaid_item_id}:`, err.response ? err.response.data : err);
-        }
       }
+      if (nr) needsReconnect.push(item.id);
     }
 
     res.json({ added: totalAdded, modified: totalModified, removed: totalRemoved, needsReconnect });
   } catch (err) {
-    console.error(err.response ? err.response.data : err);
+    console.error(plaidErrorDetail(err));
     res.status(500).json({ error: 'Failed to sync transactions' });
   }
 });
@@ -865,6 +938,10 @@ app.get('/api/transactions', async (req, res) => {
   try {
     const { date, start, end } = req.query;
     const userId = req.userId;
+
+    if ((date && !isValidDateKey(date)) || (start && !isValidDateKey(start)) || (end && !isValidDateKey(end))) {
+      return res.status(400).json({ error: 'date, start, and end must be valid YYYY-MM-DD dates' });
+    }
 
     if (date || (start && end)) {
       // Returns every transaction in range, not just the ones counted in the total, so
@@ -910,7 +987,12 @@ app.get('/api/transactions', async (req, res) => {
          FROM transactions t
          JOIN plaid_items pi ON pi.id = t.plaid_item_id
          WHERE t.user_id = $1 AND t.date BETWEEN $2 AND $5
-         ORDER BY t.date DESC, t.id`,
+         ORDER BY t.date DESC, t.id
+         LIMIT 5000`,
+        // 5000, not unbounded - every real caller asks for a day/week/month/quarter at
+        // most, so this is purely a safety cap against a pathological range (or a modified
+        // client) pulling down years of history in one response, same reasoning as the
+        // fallback branch below already having its own LIMIT 100.
         [userId, rangeStart, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, rangeEnd, PFC_DETAILED_P2P_OUT]
       );
       return res.json(result.rows);
@@ -1008,13 +1090,23 @@ app.post('/api/sync_recurring', async (req, res) => {
     // Same needs_reconnect exclusion as sync_transactions - a broken Item is guaranteed to
     // fail here too until reconnected.
     const items = await pool.query(
-      'SELECT id, plaid_item_id, access_token FROM plaid_items WHERE user_id = $1 AND needs_reconnect = false',
+      'SELECT id, plaid_item_id, access_token, recurring_synced_at FROM plaid_items WHERE user_id = $1 AND needs_reconnect = false',
       [userId]
     );
 
-    for (const item of items.rows) {
-      // Same per-item isolation as sync_transactions - one bad connection shouldn't block
-      // recurring-bill detection for the rest of a user's banks.
+    // Parallel, not sequential - same reasoning as sync_transactions above (a slow bank
+    // response with several linked accounts could otherwise push this past the client's
+    // timeout). Each item's own try/catch below keeps the per-item isolation intact.
+    await Promise.allSettled(
+      items.rows.map(async (item) => {
+      // Server-side debounce, same reasoning as sync_transactions' own guard above - the
+      // client's 10-minute gate is in-memory and resets on cold start, so this is the only
+      // thing standing between a relaunch storm and unbounded transactionsRecurringGet
+      // calls (a heavier Plaid call than a plain sync, per this route's own file comment).
+      const msSinceLastSync = item.recurring_synced_at
+        ? Date.now() - new Date(item.recurring_synced_at).getTime()
+        : Infinity;
+      if (msSinceLastSync < TRANSACTIONS_SYNC_DEBOUNCE_MS) return;
       try {
         const response = await plaidClient.transactionsRecurringGet({ access_token: decryptToken(item.access_token) });
 
@@ -1087,14 +1179,16 @@ app.post('/api/sync_recurring', async (req, res) => {
             );
           }
         }
+        await pool.query('UPDATE plaid_items SET recurring_synced_at = now() WHERE id = $1', [item.id]);
       } catch (err) {
-        console.error(`sync_recurring failed for item ${item.plaid_item_id}:`, err.response ? err.response.data : err);
+        console.error(`sync_recurring failed for item ${item.plaid_item_id}:`, plaidErrorDetail(err));
       }
-    }
+      })
+    );
 
     res.json({ ok: true });
   } catch (err) {
-    console.error(err.response ? err.response.data : err);
+    console.error(plaidErrorDetail(err));
     res.status(500).json({ error: 'Failed to sync recurring bills' });
   }
 });
@@ -1150,6 +1244,9 @@ app.get('/api/bills', async (req, res) => {
 // bill's transactions share, not a hard, unoverridable rule).
 app.patch('/api/bills/:id/include', async (req, res) => {
   try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid bill id' });
+    }
     const userId = req.userId;
     const included = !!req.body.included;
 
@@ -1161,9 +1258,14 @@ app.patch('/api/bills/:id/include', async (req, res) => {
       return res.status(404).json({ error: 'Bill not found' });
     }
 
-    await pool.query('UPDATE recurring_bills SET user_included = $1, updated_at = now() WHERE id = $2', [
+    // AND user_id = $3, not just id = $2 - not currently reachable any other way (the
+    // ownership-verifying SELECT right above already 404s a bill that isn't this user's
+    // own), but every other :id-scoped UPDATE/DELETE in this file filters on user_id
+    // directly rather than relying on a separate check beforehand, so this one should too.
+    await pool.query('UPDATE recurring_bills SET user_included = $1, updated_at = now() WHERE id = $2 AND user_id = $3', [
       included,
       req.params.id,
+      userId,
     ]);
 
     // Un-including resets to NULL (defer to the automatic rule, which excludes a
@@ -1199,6 +1301,9 @@ app.patch('/api/bills/:id/include', async (req, res) => {
 // that happened, so it can reload instead of trusting its own optimistic clear.
 app.patch('/api/bills/:id/acknowledge_increase', async (req, res) => {
   try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid bill id' });
+    }
     const result = await pool.query(
       'UPDATE recurring_bills SET previous_amount = NULL WHERE id = $1 AND user_id = $2 AND previous_amount = $3 RETURNING id',
       [req.params.id, req.userId, req.body.previous_amount]
@@ -1229,8 +1334,8 @@ app.post('/api/budget', async (req, res) => {
     // in JS, so it passed straight through to Postgres and surfaced as a generic 500
     // instead of a clean 400).
     const amount = Number(monthly_amount);
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return res.status(400).json({ error: 'monthly_amount must be a positive number' });
+    if (!Number.isFinite(amount) || amount <= 0 || amount > MAX_MONEY_AMOUNT) {
+      return res.status(400).json({ error: `monthly_amount must be a positive number up to ${MAX_MONEY_AMOUNT}` });
     }
     const weekStartDay = week_start_day ?? 0;
     if (!Number.isInteger(weekStartDay) || weekStartDay < 0 || weekStartDay > 6) {
@@ -1256,6 +1361,16 @@ app.post('/api/budget', async (req, res) => {
 // One savings goal per user - see schema.sql for why progress isn't stored here (it's
 // derived client-side from daily spend history since started_at).
 const GOAL_NAME_MAX_LENGTH = 60;
+// The actual ceiling of every NUMERIC(12,2) money column (budgets.monthly_amount,
+// savings_goals.target_amount, manual_expenses.amount) - 12 total digits, 2 after the
+// decimal, so 10 before it. Validation below only ever checked "positive," not this upper
+// bound, so a value past it wasn't rejected with a clean 400 - it hit Postgres, which threw
+// a numeric field overflow error caught by the generic handler and returned as a bare 500.
+const MAX_MONEY_AMOUNT = 9999999999.99;
+// No real manually-typed note is anywhere near this long - same reasoning as /api/search's
+// own 100-char cap on its query param, which this route was missing entirely (note is an
+// unbounded TEXT column, and /api/search's own ILIKE scan later matches against it).
+const NOTE_MAX_LENGTH = 500;
 
 function parseGoalFields(body) {
   const name = typeof body.name === 'string' ? body.name.trim() : '';
@@ -1263,8 +1378,8 @@ function parseGoalFields(body) {
     return { error: `name must be 1-${GOAL_NAME_MAX_LENGTH} characters` };
   }
   const targetAmount = Number(body.target_amount);
-  if (!Number.isFinite(targetAmount) || targetAmount <= 0) {
-    return { error: 'target_amount must be a positive number' };
+  if (!Number.isFinite(targetAmount) || targetAmount <= 0 || targetAmount > MAX_MONEY_AMOUNT) {
+    return { error: `target_amount must be a positive number up to ${MAX_MONEY_AMOUNT}` };
   }
   let targetDate = null;
   if (body.target_date != null) {
@@ -1370,6 +1485,9 @@ app.get('/api/expenses', async (req, res) => {
     if (!date && !(start && end)) {
       return res.status(400).json({ error: 'date, or start and end, query params (YYYY-MM-DD) are required' });
     }
+    if ((date && !isValidDateKey(date)) || (start && !isValidDateKey(start)) || (end && !isValidDateKey(end))) {
+      return res.status(400).json({ error: 'date, start, and end must be valid YYYY-MM-DD dates' });
+    }
     const userId = req.userId;
     const rangeStart = date || start;
     const rangeEnd = date || end;
@@ -1391,11 +1509,14 @@ app.post('/api/expenses', async (req, res) => {
     // Number(), not the raw body value - see the same fix on POST /api/budget above for
     // why (a non-numeric string slipped past the old `!amount || amount <= 0` check).
     const amount = Number(rawAmount);
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return res.status(400).json({ error: 'amount must be a positive number' });
+    if (!Number.isFinite(amount) || amount <= 0 || amount > MAX_MONEY_AMOUNT) {
+      return res.status(400).json({ error: `amount must be a positive number up to ${MAX_MONEY_AMOUNT}` });
     }
     if (!local_date) {
       return res.status(400).json({ error: 'local_date (YYYY-MM-DD, the device\'s local calendar date) is required' });
+    }
+    if (typeof note === 'string' && note.length > NOTE_MAX_LENGTH) {
+      return res.status(400).json({ error: `note must be ${NOTE_MAX_LENGTH} characters or fewer` });
     }
     const userId = req.userId;
     const result = await pool.query(
@@ -1417,6 +1538,9 @@ app.post('/api/expenses', async (req, res) => {
 
 app.delete('/api/expenses/:id', async (req, res) => {
   try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid expense id' });
+    }
     const userId = req.userId;
     await pool.query('DELETE FROM manual_expenses WHERE id = $1 AND user_id = $2', [req.params.id, userId]);
     res.json({ ok: true });
@@ -1430,6 +1554,9 @@ app.delete('/api/expenses/:id', async (req, res) => {
 // (e.g. excluding a one-off flight). Plaid transactions are never deleted, only excluded.
 app.patch('/api/transactions/:id/exclude', async (req, res) => {
   try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid transaction id' });
+    }
     const { excluded } = req.body;
     const userId = req.userId;
     await pool.query('UPDATE transactions SET user_excluded = $1 WHERE id = $2 AND user_id = $3', [
@@ -1480,6 +1607,9 @@ app.get('/api/spend', async (req, res) => {
     if (!start || !end) {
       return res.status(400).json({ error: 'start and end query params (YYYY-MM-DD) are required' });
     }
+    if (!isValidDateKey(start) || !isValidDateKey(end)) {
+      return res.status(400).json({ error: 'start and end must be valid YYYY-MM-DD dates' });
+    }
     const userId = req.userId;
 
     // Independent queries (Plaid-synced transactions vs. manual expenses, different
@@ -1515,6 +1645,9 @@ app.get('/api/spend/daily', async (req, res) => {
     if (!start || !end) {
       return res.status(400).json({ error: 'start and end query params (YYYY-MM-DD) are required' });
     }
+    if (!isValidDateKey(start) || !isValidDateKey(end)) {
+      return res.status(400).json({ error: 'start and end must be valid YYYY-MM-DD dates' });
+    }
     const userId = req.userId;
 
     const result = await pool.query(
@@ -1522,13 +1655,13 @@ app.get('/api/spend/daily', async (req, res) => {
        FROM generate_series($2::date, $3::date, interval '1 day') AS gs
        LEFT JOIN (
          SELECT t.date, SUM(t.amount) AS total FROM transactions t
-         WHERE t.user_id = $1
+         WHERE t.user_id = $1 AND t.date BETWEEN $2 AND $3
            AND ${COUNTS_TOWARD_SPEND}
          GROUP BY t.date
        ) t ON t.date = gs::date
        LEFT JOIN (
          SELECT local_date, SUM(amount) AS total FROM manual_expenses
-         WHERE user_id = $1
+         WHERE user_id = $1 AND local_date BETWEEN $2 AND $3
          GROUP BY local_date
        ) m ON m.local_date = gs::date
        ORDER BY gs`,
