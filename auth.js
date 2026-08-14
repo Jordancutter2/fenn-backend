@@ -16,6 +16,13 @@ const RESET_CODE_EXPIRY_MS = 15 * 60 * 1000;
 // impractical within the code's lifetime regardless of how many source IPs it's spread
 // across (see the schema comment on password_reset_codes.attempts).
 const MAX_RESET_CODE_ATTEMPTS = 5;
+// Looser than the reset-code cap - this covers ordinary fat-fingering a 6-digit
+// authenticator code across a session's entire pending lifetime, not one 15-minute window,
+// so it needs more slack than 5 to not lock out a real user who mistypes a couple of times.
+// Still tight enough to make a brute-force guess against the 900k-possibility keyspace
+// impractical regardless of how many source IPs it's spread across (see the schema comment
+// on sessions.mfa_attempts).
+const MAX_MFA_ATTEMPTS = 10;
 
 const MIN_PASSWORD_LENGTH = 8;
 
@@ -70,6 +77,31 @@ function generateToken() {
   return crypto.randomBytes(32).toString('hex');
 }
 
+// The DB only ever stores this, never the raw token - unlike a password, a session token
+// is already 256 bits of real randomness (not something a human chose from a small guessable
+// space), so a fast deterministic hash is the right tool here, not bcrypt: it needs to be
+// looked up by exact value on every single authenticated request, which a slow, salted hash
+// can't do without iterating every row. Anyone who could read the sessions table (a DB
+// credential leak, a backup export, a future SQL-injection bug elsewhere) previously got
+// tokens usable to impersonate a logged-in user for up to 90 days with zero further effort;
+// hashing means that same read only yields something as useless for login as a password hash
+// already is.
+function hashToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+// Postgres's default collation matches `email` case-sensitively, so without this
+// "User@x.com" and "user@x.com" would be two different rows - a real account, since they
+// commonly differ only by whatever a device happened to auto-capitalize. Applied on every
+// write AND every read-by-email path (register, login, password reset, Apple's email-match
+// lookup) so a genuine duplicate and a re-registration attempt both collide on the exact
+// same string, letting the existing UNIQUE constraint on users.email catch it the same way
+// it already catches an exact match - not just relied on the writes to be consistent while
+// leaving reads to compare mismatched casing and silently miss a real account.
+function normalizeEmail(email) {
+  return typeof email === 'string' ? email.trim().toLowerCase() : email;
+}
+
 // mfaVerified defaults true (an ordinary, immediately-usable session) - only ever passed
 // false for an account with MFA enabled, right after a correct password/Apple Sign-In but
 // before a correct MFA code, so requireAuth can reject it everywhere except the one route
@@ -78,13 +110,16 @@ async function createSession(userId, mfaVerified = true) {
   const token = generateToken();
   await pool.query('INSERT INTO sessions (user_id, token, mfa_verified) VALUES ($1, $2, $3)', [
     userId,
-    token,
+    hashToken(token),
     mfaVerified,
   ]);
+  // The raw token, not the hash - this is the one and only time it exists outside the
+  // client's own storage, the same "shown once" shape as an MFA backup code.
   return token;
 }
 
 async function register({ email, password, marketingConsent }) {
+  email = normalizeEmail(email);
   assertValidPassword(password);
   const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
   if (existing.rows.length > 0) {
@@ -122,7 +157,7 @@ async function register({ email, password, marketingConsent }) {
 async function login({ email, password }) {
   const result = await pool.query(
     'SELECT id, email, password_hash, tier, mfa_enabled, created_at FROM users WHERE email = $1',
-    [email]
+    [normalizeEmail(email)]
   );
   const user = result.rows[0];
 
@@ -155,7 +190,7 @@ async function login({ email, password }) {
 }
 
 async function logout(token) {
-  await pool.query('DELETE FROM sessions WHERE token = $1', [token]);
+  await pool.query('DELETE FROM sessions WHERE token = $1', [hashToken(token)]);
 }
 
 // Only for accounts that already have a password set - an Apple-only account has no
@@ -185,7 +220,27 @@ async function changePassword(userId, currentPassword, newPassword, currentSessi
   // regardless of the password change. Keeps the session making this very request alive
   // (excluded by token) so changing your own password doesn't immediately log out the
   // device you're sitting at right now.
-  await pool.query('DELETE FROM sessions WHERE user_id = $1 AND token != $2', [userId, currentSessionToken]);
+  await pool.query('DELETE FROM sessions WHERE user_id = $1 AND token != $2', [userId, hashToken(currentSessionToken)]);
+}
+
+// Requires the current password before an irreversible, high-consequence action, same
+// reasoning as changePassword/disableMfa above - a valid session token alone shouldn't be
+// enough to permanently destroy an account and every linked bank connection with it,
+// especially now that a leaked/stolen token is the only thing standing in the way (nothing
+// here previously re-verified anything past requireAuth). An Apple-only account (no
+// password_hash) has no password to check - the session token is the only credential that
+// ever existed for it, so this is a no-op verification for that case rather than an
+// impossible one to satisfy.
+async function verifyPasswordForSensitiveAction(userId, password) {
+  const result = await pool.query('SELECT password_hash FROM users WHERE id = $1', [userId]);
+  const user = result.rows[0];
+  if (!user?.password_hash) return;
+  if (!password || !(await bcrypt.compare(password, user.password_hash))) {
+    const err = new Error('Current password is incorrect.');
+    err.status = 401;
+    err.code = 'WRONG_CURRENT_PASSWORD';
+    throw err;
+  }
 }
 
 function generateResetCode() {
@@ -202,6 +257,7 @@ function generateResetCode() {
 // password_hash) - there's no password to reset, and emailing a code that could never
 // actually be used anywhere would just be confusing, not helpful.
 async function requestPasswordReset(email) {
+  email = normalizeEmail(email);
   const result = await pool.query('SELECT id, password_hash FROM users WHERE email = $1', [email]);
   const user = result.rows[0];
   if (!user || !user.password_hash) return;
@@ -233,7 +289,7 @@ async function requestPasswordReset(email) {
 async function resetPassword({ email, code, newPassword }) {
   assertValidPassword(newPassword);
 
-  const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+  const userResult = await pool.query('SELECT id FROM users WHERE email = $1', [normalizeEmail(email)]);
   const user = userResult.rows[0];
 
   // Same generic error regardless of which part is wrong (no such user, no pending code,
@@ -251,22 +307,39 @@ async function resetPassword({ email, code, newPassword }) {
   // and the bcrypt.compare entirely, which leaked account existence through response
   // latency despite the identical error message.
   const codeResult = await pool.query(
-    `SELECT id, code_hash, attempts FROM password_reset_codes
+    `SELECT id, code_hash FROM password_reset_codes
      WHERE user_id = $1 AND used_at IS NULL AND expires_at > now()
      ORDER BY created_at DESC LIMIT 1`,
     [user?.id ?? -1]
   );
   const resetRow = codeResult.rows[0];
+
+  // Atomically incremented and read back in the same round trip - not a separate read then
+  // a conditional write. The previous version read `attempts` once at the top, then only
+  // wrote it back after bcrypt.compare finished, which left a real window: two requests
+  // arriving close together (a slow, patient guesser spread across enough source IPs to also
+  // clear the per-IP rate limiter) could both read the same pre-increment count, both pass
+  // the cap check against it, and both get a real bcrypt.compare in before either write
+  // landed - letting concurrent guesses test past MAX_RESET_CODE_ATTEMPTS against this one
+  // code's fixed keyspace, defeating the exact thing this counter exists for. An UPDATE
+  // against the same row serializes naturally under Postgres's own row lock, so concurrent
+  // callers each get a distinct, strictly-increasing count with no race - only skipped
+  // entirely when there's no real row to increment (no user/no pending code).
+  const attempts = resetRow
+    ? (
+        await pool.query('UPDATE password_reset_codes SET attempts = attempts + 1 WHERE id = $1 RETURNING attempts', [
+          resetRow.id,
+        ])
+      ).rows[0].attempts
+    : 0;
+  // Once a code is exhausted it's dead even if this particular guess happened to be right.
+  const exhausted = resetRow && attempts > MAX_RESET_CODE_ATTEMPTS;
+
+  // Always runs, exhausted or not - same DUMMY_PASSWORD_HASH timing-safety reasoning as
+  // above; skipping it specifically once exhausted would let a patient guesser learn "this
+  // code just got capped" from response latency alone.
   const codeMatches = await bcrypt.compare(code, resetRow?.code_hash || DUMMY_PASSWORD_HASH);
-  // Once a code is exhausted it's dead even if this particular guess happened to be right -
-  // an IP-keyed rate limit alone doesn't stop a slow, patient guess spread across many
-  // source IPs against this one code's fixed 900k-possibility keyspace (see the schema
-  // comment on `attempts`), so the cap has to hold regardless of which guess lands.
-  const exhausted = resetRow && resetRow.attempts >= MAX_RESET_CODE_ATTEMPTS;
   if (!user || !resetRow || !codeMatches || exhausted) {
-    if (resetRow && !exhausted) {
-      await pool.query('UPDATE password_reset_codes SET attempts = attempts + 1 WHERE id = $1', [resetRow.id]);
-    }
     invalidCodeError();
   }
 
@@ -297,7 +370,7 @@ async function loginWithApple({ identityToken, email: emailFromClient, marketing
   }
 
   const appleUserId = payload.sub;
-  const email = payload.email || emailFromClient || null;
+  const email = normalizeEmail(payload.email || emailFromClient || null);
 
   // created_at included in every branch below - see login()'s own comment for why it
   // has to be there, not just cosmetic.
@@ -472,7 +545,7 @@ async function verifyMfaLogin(token, code) {
     `SELECT s.id AS session_id, s.mfa_verified, u.id AS user_id, u.email, u.tier, u.mfa_secret, u.created_at
      FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token = $1`,
-    [token]
+    [hashToken(token)]
   );
   const row = result.rows[0];
   if (!row) {
@@ -485,8 +558,28 @@ async function verifyMfaLogin(token, code) {
   // just cosmetic.
   const user = { id: row.user_id, email: row.email, tier: row.tier, created_at: row.created_at };
   if (row.mfa_verified) {
-    // Already verified (e.g. a retried request) - idempotent success, not an error.
+    // Already verified (e.g. a retried request) - idempotent success, not an error, and
+    // not a guess against anything - doesn't touch mfa_attempts.
     return { user };
+  }
+
+  // Atomically incremented and read back in one round trip, same shape and same reasoning
+  // as password_reset_codes.attempts (see schema.sql) - a pending session otherwise had no
+  // real cap on how many codes could be tried against it beyond the per-IP rate limiter,
+  // which alone doesn't stop a guess spread across enough source IPs against this session's
+  // fixed 6-digit TOTP keyspace for its whole lifetime. Exhausting this kills the session
+  // outright rather than just rejecting further guesses - a pending session that's shown
+  // signs of being guessed at has already lost its only useful property (being one correct
+  // code away from trusted), so there's nothing worth preserving by leaving it alive.
+  const attemptResult = await pool.query(
+    'UPDATE sessions SET mfa_attempts = mfa_attempts + 1 WHERE id = $1 RETURNING mfa_attempts',
+    [row.session_id]
+  );
+  if (attemptResult.rows[0].mfa_attempts > MAX_MFA_ATTEMPTS) {
+    await pool.query('DELETE FROM sessions WHERE id = $1', [row.session_id]);
+    const err = new Error('Too many incorrect codes. Log in again.');
+    err.status = 401;
+    throw err;
   }
 
   const secret = decryptToken(row.mfa_secret);
@@ -532,11 +625,12 @@ async function requireAuth(req, res, next) {
   // /api/auth/change-password, a wrong code on /api/auth/mfa/verify-login, a wrong
   // password on /api/auth/login itself) - none of which should force a logout.
   if (!token) return res.status(401).json({ error: 'Not authenticated', code: 'SESSION_INVALID' });
+  const tokenHash = hashToken(token);
 
   const result = await pool.query(
     `SELECT user_id, mfa_verified FROM sessions
      WHERE token = $1 AND last_used_at > now() - interval '${SESSION_LIFETIME_DAYS} days'`,
-    [token]
+    [tokenHash]
   );
   if (result.rows.length === 0) return res.status(401).json({ error: 'Not authenticated', code: 'SESSION_INVALID' });
 
@@ -554,7 +648,7 @@ async function requireAuth(req, res, next) {
     .query(
       `UPDATE sessions SET last_used_at = now()
        WHERE token = $1 AND last_used_at < now() - interval '${SESSION_REFRESH_THRESHOLD_DAYS} days'`,
-      [token]
+      [tokenHash]
     )
     .catch((err) => console.error('Failed to refresh session last_used_at:', err));
 
@@ -568,6 +662,7 @@ module.exports = {
   logout,
   requireAuth,
   changePassword,
+  verifyPasswordForSensitiveAction,
   requestPasswordReset,
   resetPassword,
   setupMfa,

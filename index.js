@@ -15,6 +15,7 @@ const {
   logout,
   requireAuth,
   changePassword,
+  verifyPasswordForSensitiveAction,
   requestPasswordReset,
   resetPassword,
   setupMfa,
@@ -349,7 +350,14 @@ app.post('/api/auth/mfa/verify-login', loginLimiter, async (req, res) => {
 // which cascades to every other table (transactions, budgets, expenses, bills, sessions).
 // webhook_log isn't a foreign key (see its schema comment), so it needs its own explicit
 // cleanup here - otherwise Plaid-derived data would linger with no remaining business need.
-app.delete('/api/account', requireAuth, async (req, res) => {
+// loginLimiter, same reasoning as change-password/mfa-disable above - this now also
+// compares a real password via bcrypt.
+app.delete('/api/account', requireAuth, loginLimiter, async (req, res) => {
+  try {
+    await verifyPasswordForSensitiveAction(req.userId, req.body?.password);
+  } catch (err) {
+    return res.status(err.status || 401).json({ error: err.message, code: err.code });
+  }
   try {
     const items = await pool.query('SELECT access_token, plaid_item_id FROM plaid_items WHERE user_id = $1', [
       req.userId,

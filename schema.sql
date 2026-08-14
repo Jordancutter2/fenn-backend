@@ -80,6 +80,9 @@ ALTER TABLE users DROP COLUMN IF EXISTS include_recurring_bills;
 CREATE TABLE IF NOT EXISTS sessions (
   id SERIAL PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  -- A SHA-256 hash of the bearer token (see auth.js's hashToken), never the raw token
+  -- itself - a session token is high-entropy already, so unlike a password this doesn't
+  -- need bcrypt's slowness, just enough that reading this column alone can't be replayed.
   token TEXT UNIQUE NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -93,6 +96,13 @@ ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ NOT NULL 
 -- (or Apple Sign-In) and a correct MFA code, for an account with MFA turned on - requireAuth
 -- rejects a session in this state for every route except the one that verifies the code.
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS mfa_verified BOOLEAN NOT NULL DEFAULT true;
+-- Counts wrong codes tried against this one pending (mfa_verified=false) session. The
+-- per-IP rate limiter on /api/auth/mfa/verify-login doesn't stop a guess spread across many
+-- source IPs against one session's fixed 6-digit TOTP keyspace for its whole lifetime -
+-- same reasoning as password_reset_codes.attempts above, just for the post-password,
+-- pre-MFA gap instead. Exhausting this deletes the session outright (verifyMfaLogin), not
+-- just blocks further guesses on it.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS mfa_attempts INTEGER NOT NULL DEFAULT 0;
 -- token's own UNIQUE constraint already indexes the requireAuth lookup path (every
 -- authenticated request). This is for the separate by-user queries - invalidating every
 -- other session on a password change, and clearing all of a user's sessions on delete.
