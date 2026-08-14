@@ -626,7 +626,10 @@ app.get('/plaid-oauth', (req, res) => {
   res.send('<p>Redirecting back to Fenn&hellip; you can close this window.</p>');
 });
 
-app.post('/api/create_link_token', requirePaidTier, async (req, res) => {
+// authLimiter, same as every other Plaid-calling route not gated by its own tighter cap -
+// this hits Plaid's own API on every call with no server-side debounce of its own, unlike
+// sync_transactions/sync_recurring.
+app.post('/api/create_link_token', requirePaidTier, authLimiter, async (req, res) => {
   try {
     const { item_id } = req.body || {};
 
@@ -673,6 +676,9 @@ app.post('/api/create_link_token', requirePaidTier, async (req, res) => {
 // we just clear the flag so the reconnect banner goes away.
 app.post('/api/plaid_items/:id/reconnected', async (req, res) => {
   try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid bank connection id' });
+    }
     await pool.query(
       'UPDATE plaid_items SET needs_reconnect = false, new_accounts_available = false WHERE id = $1 AND user_id = $2',
       [req.params.id, req.userId]
@@ -692,6 +698,9 @@ app.post('/api/plaid_items/:id/reconnected', async (req, res) => {
 // account deletion above.
 app.delete('/api/plaid_items/:id', async (req, res) => {
   try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid bank connection id' });
+    }
     const item = await pool.query('SELECT access_token, plaid_item_id FROM plaid_items WHERE id = $1 AND user_id = $2', [
       req.params.id,
       req.userId,
@@ -1178,12 +1187,16 @@ app.post('/api/sync_recurring', async (req, res) => {
             // this is what makes toggling a bill apply to future occurrences automatically,
             // without silently clobbering a one-off exception someone already set on a
             // specific past occurrence.
+            // AND user_id = $4 even though plaid_transaction_id is already globally unique
+            // (so this isn't currently reachable any other way) - same defense-in-depth
+            // reasoning the rest of this file applies to every other :id-scoped mutation,
+            // rather than relying purely on an external uniqueness guarantee holding.
             await pool.query(
               `UPDATE transactions
                SET is_recurring_bill = true, recurring_bill_id = $2,
                    user_excluded = CASE WHEN user_excluded IS NULL AND $3 THEN false ELSE user_excluded END
-               WHERE plaid_transaction_id = ANY($1)`,
-              [stream.transaction_ids, billResult.rows[0].id, billResult.rows[0].user_included]
+               WHERE plaid_transaction_id = ANY($1) AND user_id = $4`,
+              [stream.transaction_ids, billResult.rows[0].id, billResult.rows[0].user_included, userId]
             );
           }
         }
@@ -1520,7 +1533,12 @@ app.post('/api/expenses', async (req, res) => {
     if (!Number.isFinite(amount) || amount <= 0 || amount > MAX_MONEY_AMOUNT) {
       return res.status(400).json({ error: `amount must be a positive number up to ${MAX_MONEY_AMOUNT}` });
     }
-    if (!local_date) {
+    // isValidDateKey, not just a truthiness check - a malformed value (wrong format, or a
+    // syntactically-plausible-but-nonexistent date) fell straight through to Postgres,
+    // which threw a type-cast error caught by the generic handler and returned as a bare
+    // 500 instead of a clean 400, the exact bug this same helper already fixed for every
+    // date *query* param in this file - this one's a body param, which got missed.
+    if (!isValidDateKey(local_date)) {
       return res.status(400).json({ error: 'local_date (YYYY-MM-DD, the device\'s local calendar date) is required' });
     }
     if (typeof note === 'string' && note.length > NOTE_MAX_LENGTH) {
