@@ -228,12 +228,14 @@ ALTER TABLE recurring_bills ADD COLUMN IF NOT EXISTS user_included BOOLEAN NOT N
 -- is_recurring_bill during /api/sync_recurring), so per-bill inclusion choices can be
 -- applied when computing spend.
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS recurring_bill_id INTEGER REFERENCES recurring_bills(id);
--- Marks a specific P2P transfer-in (Venmo/Zelle/Cash App/PayPal - see PFC_DETAILED_P2P_IN
--- in app/api.js) as real income rather than the neutral transfer these default to - Plaid's
--- own category can't tell a friend's reimbursement apart from an actual gig/freelance
--- payment, so this is the user's own per-transaction call. Deliberately separate from
--- user_excluded, which only ever affects spend counting, never income.
-ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_marked_income BOOLEAN NOT NULL DEFAULT false;
+-- A P2P transfer-in (Venmo/Zelle/Cash App/PayPal - see PFC_DETAILED_P2P_IN in app/api.js)
+-- counts as income by default, same as any other deposit - it's real money that arrived.
+-- This is the escape hatch for the rare one that genuinely wasn't (a one-off gift, a
+-- refund of your own money) - excluding it here drops it back to a neutral transfer
+-- instead. Deliberately separate from user_excluded, which only ever affects spend
+-- counting, never income. Column was originally added under the opposite polarity
+-- (opt-in "mark as income") and renamed once the default flipped to opt-out.
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_income_excluded BOOLEAN NOT NULL DEFAULT false;
 
 -- Queried by user_id directly every time the Bills tab loads.
 CREATE INDEX IF NOT EXISTS idx_recurring_bills_user ON recurring_bills(user_id);

@@ -974,7 +974,7 @@ app.get('/api/transactions', async (req, res) => {
         // total silently didn't include it. is_recurring_bill is now checked before the
         // P2P_OUT carve-out, not folded into the fallback ELSE after it, so a recurring
         // P2P payment is excluded by default same as any other recurring bill.
-        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pending, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, t.user_marked_income, pi.institution_name,
+        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pending, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, t.user_income_excluded, pi.institution_name,
            CASE
              WHEN t.amount <= 0 THEN true
              WHEN t.user_excluded IS NOT NULL THEN t.user_excluded
@@ -1033,7 +1033,7 @@ app.get('/api/search', async (req, res) => {
 
     const [txns, manual] = await Promise.all([
       pool.query(
-        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, t.user_marked_income, pi.institution_name,
+        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, t.user_income_excluded, pi.institution_name,
            CASE
              WHEN t.amount <= 0 THEN true
              WHEN t.user_excluded IS NOT NULL THEN t.user_excluded
@@ -1571,20 +1571,22 @@ app.patch('/api/transactions/:id/exclude', async (req, res) => {
   }
 });
 
-// Marks (or unmarks) a P2P transfer-in (Venmo/Zelle/Cash App/PayPal) as real income -
-// separate from the exclude toggle above, which only ever affects spend counting. Not
-// restricted to a particular pfc_detailed value here - the frontend only ever shows this
-// control on a P2P transfer-in, but there's no harm in the backend accepting it generically
-// (same reasoning /exclude above doesn't check the transaction's own category either).
-app.patch('/api/transactions/:id/mark_income', async (req, res) => {
+// Excludes (or re-includes) a specific P2P transfer-in (Venmo/Zelle/Cash App/PayPal) from
+// income - these count as income by default, this is the escape hatch for the rare one
+// that genuinely wasn't. Separate from the exclude toggle above, which only ever affects
+// spend counting. Not restricted to a particular pfc_detailed value here - the frontend
+// only ever shows this control on a P2P transfer-in, but there's no harm in the backend
+// accepting it generically (same reasoning /exclude above doesn't check the transaction's
+// own category either).
+app.patch('/api/transactions/:id/exclude_income', async (req, res) => {
   try {
     if (!isValidId(req.params.id)) {
       return res.status(400).json({ error: 'Invalid transaction id' });
     }
-    const { marked } = req.body;
+    const { excluded } = req.body;
     const userId = req.userId;
-    await pool.query('UPDATE transactions SET user_marked_income = $1 WHERE id = $2 AND user_id = $3', [
-      !!marked,
+    await pool.query('UPDATE transactions SET user_income_excluded = $1 WHERE id = $2 AND user_id = $3', [
+      !!excluded,
       req.params.id,
       userId,
     ]);
