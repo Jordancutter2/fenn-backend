@@ -1126,6 +1126,10 @@ app.post('/api/sync_recurring', async (req, res) => {
       if (msSinceLastSync < TRANSACTIONS_SYNC_DEBOUNCE_MS) return;
       try {
         const response = await plaidClient.transactionsRecurringGet({ access_token: decryptToken(item.access_token) });
+        // Every transaction_id this sync actually saw across this item's qualifying
+        // streams - used below to clear is_recurring_bill from anything that dropped out,
+        // since nothing else in this loop ever un-flags a transaction once flagged.
+        const currentTransactionIds = [];
 
         for (const stream of response.data.outflow_streams) {
           // Belt-and-suspenders: outflow_streams should already exclude income/refunds
@@ -1182,6 +1186,7 @@ app.post('/api/sync_recurring', async (req, res) => {
           );
 
           if (stream.transaction_ids.length > 0) {
+            currentTransactionIds.push(...stream.transaction_ids);
             // A newly-linked transaction inherits the bill's include/exclude choice only if
             // it doesn't already have its own individual override (user_excluded IS NULL) -
             // this is what makes toggling a bill apply to future occurrences automatically,
@@ -1200,6 +1205,31 @@ app.post('/api/sync_recurring', async (req, res) => {
             );
           }
         }
+
+        // Clears is_recurring_bill from any transaction still tied to one of THIS item's
+        // bills that this sync's streams no longer include - Plaid's recurring detector
+        // regularly re-evaluates stream membership (a transaction can drop out of a stream
+        // that's still otherwise active, or the whole stream can disappear/go inactive),
+        // and until now nothing anywhere ever un-flagged a transaction once flagged, so it
+        // stayed permanently excluded from spend totals (COUNTS_TOWARD_SPEND requires
+        // is_recurring_bill = false) with no bill left in /api/bills to toggle it back on
+        // from - only the manual per-transaction override could ever recover it. Scoped to
+        // this item's own bills (rb.plaid_item_id) so syncing one linked bank can't touch
+        // flags set by another. user_excluded is deliberately left alone here, same as
+        // toggling a bill's own include/exclude never resets an individual transaction's
+        // override either - a transaction that fell out of automatic detection but was
+        // manually set either way keeps that choice.
+        await pool.query(
+          `UPDATE transactions t
+           SET is_recurring_bill = false, recurring_bill_id = NULL
+           FROM recurring_bills rb
+           WHERE t.recurring_bill_id = rb.id
+             AND rb.plaid_item_id = $1
+             AND t.user_id = $2
+             AND NOT (t.plaid_transaction_id = ANY($3))`,
+          [item.id, userId, currentTransactionIds]
+        );
+
         await pool.query('UPDATE plaid_items SET recurring_synced_at = now() WHERE id = $1', [item.id]);
       } catch (err) {
         console.error(`sync_recurring failed for item ${item.plaid_item_id}:`, plaidErrorDetail(err));
