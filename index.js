@@ -156,6 +156,21 @@ const authLimiter = rateLimit({
   message: { error: 'Too many attempts. Try again in a few minutes.' },
 });
 
+// /plaid-webhook is necessarily public and unauthenticated - Plaid's own JWT signature is
+// the only real gate, but verifying an unrecognized kid still costs one live call to
+// Plaid's webhookVerificationKeyGet (see getPlaidWebhookVerificationKey), so a forged
+// request with a random kid isn't free even when correctly rejected. Generous limit, not
+// tight like loginLimiter - legitimate Plaid traffic isn't one guessable secret per IP,
+// it's real webhook volume that can legitimately burst (several codes for one bank link
+// within seconds, several users' banks syncing around the same time), all arriving from
+// Plaid's own shared IP pool rather than a single attacker's.
+const webhookLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // node-postgres parses DATE columns into JS Date objects using the *local* timezone of
 // this process, not UTC. Reading the date back out with local getters (not toISOString,
 // which is UTC) correctly reverses that regardless of what timezone this server runs in.
@@ -300,7 +315,11 @@ app.post('/api/auth/mfa/setup', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/auth/mfa/confirm', requireAuth, async (req, res) => {
+// loginLimiter, same reasoning as change-password/mfa/disable above - this compares a real
+// TOTP code (a guessable secret, 1-in-1,000,000 keyspace), so it belongs in the tightly-
+// limited tier too. Was missing this despite mfa/disable's own comment already noting it
+// shouldn't be left uncapped "like the other requireAuth-only MFA routes above it."
+app.post('/api/auth/mfa/confirm', requireAuth, loginLimiter, async (req, res) => {
   try {
     const { code } = req.body;
     if (!code) return res.status(400).json({ error: 'Code is required.' });
@@ -481,15 +500,24 @@ async function verifyPlaidWebhook(req) {
   const kid = decoded?.header?.kid;
   if (!kid) throw new Error('could not read kid from JWT header');
 
+  // Outside the try/retry below on purpose - a kid Plaid's own API doesn't recognize at all
+  // (forged, or just garbage) has no reason to be retried with a forced refresh; it'll fail
+  // identically the second time. Previously this and the jwt.verify below shared one catch
+  // block, so ANY failure - including a kid that was never valid - triggered a second live
+  // call to Plaid's webhookVerificationKeyGet, doubling the cost of every forged request
+  // against an endpoint that's necessarily public and unauthenticated.
+  const key = await getPlaidWebhookVerificationKey(kid);
+
   let payload;
   try {
-    const key = await getPlaidWebhookVerificationKey(kid);
     payload = jwt.verify(signedJwt, key, { algorithms: ['ES256'], maxAge: PLAID_WEBHOOK_MAX_AGE_SECONDS });
   } catch (err) {
-    // The cached key could just be stale (Plaid rotates these occasionally) - retry once
-    // against a freshly-fetched key before actually giving up, per Plaid's own guidance.
-    const key = await getPlaidWebhookVerificationKey(kid, { forceRefresh: true });
-    payload = jwt.verify(signedJwt, key, { algorithms: ['ES256'], maxAge: PLAID_WEBHOOK_MAX_AGE_SECONDS });
+    // The cached key itself could just be stale (Plaid rotates these occasionally) - retry
+    // once against a freshly-fetched key before actually giving up, per Plaid's own
+    // guidance. Only reached once a real key for this kid was already found above, so a
+    // never-valid kid never gets here at all.
+    const freshKey = await getPlaidWebhookVerificationKey(kid, { forceRefresh: true });
+    payload = jwt.verify(signedJwt, freshKey, { algorithms: ['ES256'], maxAge: PLAID_WEBHOOK_MAX_AGE_SECONDS });
   }
 
   if (!req.rawBody) throw new Error('no raw body captured to verify');
@@ -509,7 +537,7 @@ async function verifyPlaidWebhook(req) {
 // handler kept succeeding in production even when the resync didn't - work started after
 // res.sendStatus() just wasn't reliably finishing). Plaid tolerates several seconds before
 // treating a webhook as failed, so doing the work synchronously here is well within that.
-app.post('/plaid-webhook', async (req, res) => {
+app.post('/plaid-webhook', webhookLimiter, async (req, res) => {
   try {
     await verifyPlaidWebhook(req);
   } catch (err) {
@@ -1309,25 +1337,39 @@ app.patch('/api/bills/:id/include', async (req, res) => {
       return res.status(404).json({ error: 'Bill not found' });
     }
 
-    // AND user_id = $3, not just id = $2 - not currently reachable any other way (the
-    // ownership-verifying SELECT right above already 404s a bill that isn't this user's
-    // own), but every other :id-scoped UPDATE/DELETE in this file filters on user_id
-    // directly rather than relying on a separate check beforehand, so this one should too.
-    await pool.query('UPDATE recurring_bills SET user_included = $1, updated_at = now() WHERE id = $2 AND user_id = $3', [
-      included,
-      req.params.id,
-      userId,
-    ]);
+    // Both UPDATEs in one transaction - a crash between them would leave the bill-level
+    // flag and its linked transactions disagreeing (the bill shows "included" but none of
+    // its past transactions actually count toward spend yet, or vice versa) until the next
+    // full include/exclude toggle happened to fix it.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      // AND user_id = $3, not just id = $2 - not currently reachable any other way (the
+      // ownership-verifying SELECT above already 404s a bill that isn't this user's own),
+      // but every other :id-scoped UPDATE/DELETE in this file filters on user_id directly
+      // rather than relying on a separate check beforehand, so this one should too.
+      await client.query('UPDATE recurring_bills SET user_included = $1, updated_at = now() WHERE id = $2 AND user_id = $3', [
+        included,
+        req.params.id,
+        userId,
+      ]);
 
-    // Un-including resets to NULL (defer to the automatic rule, which excludes a
-    // recurring bill by default) rather than an explicit false - false would be
-    // indistinguishable from "the user deliberately force-included this one occurrence
-    // and then changed their mind," which isn't what un-including the whole bill means.
-    await pool.query(
-      `UPDATE transactions SET user_excluded = $1
-       WHERE recurring_bill_id = $2 AND user_id = $3`,
-      [included ? false : null, req.params.id, userId]
-    );
+      // Un-including resets to NULL (defer to the automatic rule, which excludes a
+      // recurring bill by default) rather than an explicit false - false would be
+      // indistinguishable from "the user deliberately force-included this one occurrence
+      // and then changed their mind," which isn't what un-including the whole bill means.
+      await client.query(
+        `UPDATE transactions SET user_excluded = $1
+         WHERE recurring_bill_id = $2 AND user_id = $3`,
+        [included ? false : null, req.params.id, userId]
+      );
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
 
     res.json({ ok: true });
   } catch (err) {

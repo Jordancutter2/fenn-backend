@@ -213,14 +213,28 @@ async function changePassword(userId, currentPassword, newPassword, currentSessi
   }
 
   const newHash = await bcrypt.hash(newPassword, 10);
-  await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, userId]);
 
-  // A stolen session token should stop working the moment the legitimate owner changes
-  // their password - without this, whoever had it keeps full access indefinitely,
-  // regardless of the password change. Keeps the session making this very request alive
-  // (excluded by token) so changing your own password doesn't immediately log out the
-  // device you're sitting at right now.
-  await pool.query('DELETE FROM sessions WHERE user_id = $1 AND token != $2', [userId, hashToken(currentSessionToken)]);
+  // Both statements in one transaction - split across two separate auto-committed queries,
+  // a crash between them (rare, but Railway restarts/deploys happen) could leave the new
+  // password hash saved while every old, potentially-stolen session token was still valid
+  // indefinitely, the exact thing the DELETE below exists to prevent.
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, userId]);
+    // A stolen session token should stop working the moment the legitimate owner changes
+    // their password - without this, whoever had it keeps full access indefinitely,
+    // regardless of the password change. Keeps the session making this very request alive
+    // (excluded by token) so changing your own password doesn't immediately log out the
+    // device you're sitting at right now.
+    await client.query('DELETE FROM sessions WHERE user_id = $1 AND token != $2', [userId, hashToken(currentSessionToken)]);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 // Requires the current password before an irreversible, high-consequence action, same
@@ -453,9 +467,17 @@ async function loginWithApple({ identityToken, email: emailFromClient, marketing
 // anything that isn't exactly 6 digits, which includes every backup code by design. Without
 // this wrapper, a backup-code attempt would crash instead of falling through to actually
 // check backup codes.
+//
+// epochTolerance defaults to 0 - confirmed directly against this pinned otplib version that
+// a code generated exactly one 30-second step in the past is rejected even though a real
+// authenticator app would still be showing it. Not a security hole (stricter, not looser),
+// but ordinary request latency or a few seconds of clock drift between the phone and this
+// server would otherwise produce spurious "Incorrect code" failures on every MFA login.
+// ±30s (one step each way) is the standard tolerance most authenticator-app integrations
+// assume a server will allow.
 async function safeVerifyTotp(secret, code) {
   try {
-    return await verifyTotp({ secret, token: code });
+    return await verifyTotp({ secret, token: code, epochTolerance: 30 });
   } catch (err) {
     return { valid: false };
   }
