@@ -277,6 +277,31 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   res.json(result.rows[0] || null);
 });
 
+// The global "exclude all transfers" setting (Settings > EXCLUDE ALL TRANSFERS) - only
+// ever changes the DEFAULT applied to a P2P transaction with no individual override, same
+// as is_recurring_bill already does for a recognized bill. A dedicated GET/PATCH pair, not
+// folded into /api/auth/me, matching every other Settings toggle in this app (Face ID,
+// recap notifications, streak mode) - each independently fetched/persisted rather than
+// threaded through the shared user object. See COUNTS_TOWARD_SPEND and /api/transactions
+// for where this actually gets read.
+app.get('/api/settings/p2p-transfers-excluded', requireAuth, async (req, res) => {
+  const excluded = await getP2PTransfersExcluded(req.userId);
+  res.json({ excluded });
+});
+
+app.patch('/api/settings/p2p-transfers-excluded', requireAuth, async (req, res) => {
+  try {
+    await pool.query('UPDATE users SET p2p_transfers_excluded = $1 WHERE id = $2', [
+      !!req.body?.excluded,
+      req.userId,
+    ]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update setting' });
+  }
+});
+
 // loginLimiter, not authLimiter - this compares a real password via bcrypt, the same
 // "genuinely guessable-secret" category login/mfa-verify-login are already tightly limited
 // for (see the comment on loginLimiter above). A stolen/leaked session token would
@@ -977,6 +1002,33 @@ const AUTO_EXCLUDED_PFC_DETAILED = ['LOAN_PAYMENTS_CREDIT_CARD_PAYMENT'];
 // transaction, it's just categorized differently for display (see categorizeExpenses in
 // api.js on the frontend).
 const PFC_DETAILED_P2P_OUT = 'TRANSFER_OUT_TRANSFER_OUT_FROM_APPS';
+// The inflow-side counterpart above - needed here now too (previously only the frontend's
+// own copy of this constant, in api.js, mattered - income classification used to be
+// entirely a client-side concern) so a P2P-in's resolved user_income_excluded can defer to
+// users.p2p_transfers_excluded server-side, the same way a P2P-out's resolved excluded
+// already defers to it.
+const PFC_DETAILED_P2P_IN = 'TRANSFER_IN_TRANSFER_IN_FROM_APPS';
+
+// Plaid's own per-transaction categorizer isn't reliable enough to trust alone for the new
+// "exclude all transfers" setting - confirmed live on real production data: the exact same
+// real-world Zelle sender ("ZEL FROM JACKSON CUTTER") came back correctly tagged
+// TRANSFER_IN_TRANSFER_IN_FROM_APPS most of the time but INCOME_CONTRACTOR at least twice.
+// A user turning that setting on almost certainly means "none of this," not "whichever
+// ones Plaid happened to categorize correctly" - so the same name-pattern fallback already
+// used on the frontend (isP2PIn/isP2POut in api.js) is mirrored here in SQL, gated the same
+// way: only ever a fallback alongside the real pfc_detailed check, never a replacement for
+// it. \y is Postgres's own word-boundary escape (POSIX doesn't support \b the way PCRE
+// does) - matches "ZEL"/"ZELLE"/"VENMO"/"CASH APP"/"PAYPAL" as whole words, case-insensitive.
+const P2P_NAME_PATTERN = '\\y(zel(le)?|venmo|cash ?app|paypal)\\y';
+
+// One row-per-request lookup, not a JOIN in every query that needs it - p2p_transfers_excluded
+// only matters to a handful of routes (spend totals, the transactions/search listings), and a
+// JOIN against users in each of those queries would be more invasive than a single cheap
+// primary-key lookup up front.
+async function getP2PTransfersExcluded(userId) {
+  const result = await pool.query('SELECT p2p_transfers_excluded FROM users WHERE id = $1', [userId]);
+  return result.rows[0]?.p2p_transfers_excluded ?? false;
+}
 
 // Read-only view of what's actually in our database now, for testing/verification.
 app.get('/api/transactions', async (req, res) => {
@@ -1003,6 +1055,7 @@ app.get('/api/transactions', async (req, res) => {
       // rest of it, which is a real problem independent of anyone's intent to include it.
       const rangeStart = date || start;
       const rangeEnd = date || end;
+      const p2pExcluded = await getP2PTransfersExcluded(userId);
 
       const result = await pool.query(
         // to_char, not a bare column - pg's driver otherwise serializes a raw DATE column
@@ -1019,16 +1072,26 @@ app.get('/api/transactions', async (req, res) => {
         // total silently didn't include it. is_recurring_bill is now checked before the
         // P2P_OUT carve-out, not folded into the fallback ELSE after it, so a recurring
         // P2P payment is excluded by default same as any other recurring bill.
-        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pending, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, t.user_income_excluded, pi.institution_name,
+        //
+        // user_income_excluded is resolved server-side now too (was a bare column before)
+        // for the same reason excluded already is - so a P2P-in's income status can defer
+        // to users.p2p_transfers_excluded ($7) the moment there's no individual override,
+        // without the frontend needing to know that setting exists at all.
+        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pending, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, pi.institution_name,
            CASE
              WHEN t.amount <= 0 THEN true
              WHEN t.user_excluded IS NOT NULL THEN t.user_excluded
              WHEN t.is_recurring_bill THEN true
-             WHEN t.pfc_detailed = $6 THEN false
+             WHEN (t.pfc_detailed = $6 OR t.name ~* $9) THEN $7
              ELSE (
                COALESCE(t.pfc_primary, '') = ANY($3) OR COALESCE(t.pfc_detailed, '') = ANY($4)
              )
-           END AS excluded
+           END AS excluded,
+           CASE
+             WHEN t.user_income_excluded IS NOT NULL THEN t.user_income_excluded
+             WHEN (t.pfc_detailed = $8 OR (t.amount < 0 AND t.name ~* $9)) THEN $7
+             ELSE false
+           END AS user_income_excluded
          FROM transactions t
          JOIN plaid_items pi ON pi.id = t.plaid_item_id
          WHERE t.user_id = $1 AND t.date BETWEEN $2 AND $5
@@ -1038,7 +1101,7 @@ app.get('/api/transactions', async (req, res) => {
         // most, so this is purely a safety cap against a pathological range (or a modified
         // client) pulling down years of history in one response, same reasoning as the
         // fallback branch below already having its own LIMIT 100.
-        [userId, rangeStart, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, rangeEnd, PFC_DETAILED_P2P_OUT]
+        [userId, rangeStart, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, rangeEnd, PFC_DETAILED_P2P_OUT, p2pExcluded, PFC_DETAILED_P2P_IN, P2P_NAME_PATTERN]
       );
       return res.json(result.rows);
     }
@@ -1075,25 +1138,31 @@ app.get('/api/search', async (req, res) => {
     const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 100) : '';
     if (q.length < 2) return res.json({ transactions: [], manual: [] });
     const like = `%${q}%`;
+    const p2pExcluded = await getP2PTransfersExcluded(userId);
 
     const [txns, manual] = await Promise.all([
       pool.query(
-        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, t.user_income_excluded, pi.institution_name,
+        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, pi.institution_name,
            CASE
              WHEN t.amount <= 0 THEN true
              WHEN t.user_excluded IS NOT NULL THEN t.user_excluded
              WHEN t.is_recurring_bill THEN true
-             WHEN t.pfc_detailed = $5 THEN false
+             WHEN (t.pfc_detailed = $5 OR t.name ~* $8) THEN $6
              ELSE (
                COALESCE(t.pfc_primary, '') = ANY($3) OR COALESCE(t.pfc_detailed, '') = ANY($4)
              )
-           END AS excluded
+           END AS excluded,
+           CASE
+             WHEN t.user_income_excluded IS NOT NULL THEN t.user_income_excluded
+             WHEN (t.pfc_detailed = $7 OR (t.amount < 0 AND t.name ~* $8)) THEN $6
+             ELSE false
+           END AS user_income_excluded
          FROM transactions t
          JOIN plaid_items pi ON pi.id = t.plaid_item_id
          WHERE t.user_id = $1 AND (t.merchant_name ILIKE $2 OR t.name ILIKE $2)
          ORDER BY t.date DESC, t.id
          LIMIT 50`,
-        [userId, like, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, PFC_DETAILED_P2P_OUT]
+        [userId, like, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, PFC_DETAILED_P2P_OUT, p2pExcluded, PFC_DETAILED_P2P_IN, P2P_NAME_PATTERN]
       ),
       pool.query(
         `SELECT id, amount, note, to_char(local_date, 'YYYY-MM-DD') AS local_date, occurred_at
@@ -1705,6 +1774,21 @@ app.patch('/api/transactions/:id/exclude_income', async (req, res) => {
 // transaction regardless of category, true always excludes it. Refunds (amount <= 0) are
 // the one exception with no override in either direction - see the comment above
 // /api/transactions for why.
+//
+// The P2P_OUT branch ($6, now also matched by name via $8 - see P2P_NAME_PATTERN's own
+// comment on why) used to count unconditionally the moment a transaction matched it - now
+// gated on NOT $7 (users.p2p_transfers_excluded) too, so someone who's turned on "exclude
+// all transfers" gets that respected here, not just in the itemized list.
+//
+// A real CASE, not the plain nested OR/AND this used to be - that shape has a genuine
+// conflation bug once a name-only match (Plaid categorized it as something unrelated
+// entirely, like PERSONAL_CARE) needs to be excluded too: as a bare OR term, failing the
+// "is P2P_OUT AND setting is off" branch would have fallen through to the *generic*
+// category check right after it, which a PERSONAL_CARE-tagged transaction passes cleanly
+// (nothing about it looks like a transfer to that check), silently counting it anyway. A
+// CASE stops that fallthrough the moment either signal (category or name) says this is a
+// P2P payment - the generic check underneath is only ever reached for something neither
+// signal recognized as P2P at all.
 const COUNTS_TOWARD_SPEND = `
   (
     t.amount > 0
@@ -1713,13 +1797,13 @@ const COUNTS_TOWARD_SPEND = `
       OR (
         t.user_excluded IS NULL
         AND t.is_recurring_bill = false
-        AND (
-          t.pfc_detailed = $6
-          OR (
-            COALESCE(t.pfc_primary, '') != ALL($4)
-            AND COALESCE(t.pfc_detailed, '') != ALL($5)
-          )
-        )
+        AND CASE
+              WHEN (t.pfc_detailed = $6 OR t.name ~* $8) THEN NOT $7
+              ELSE (
+                COALESCE(t.pfc_primary, '') != ALL($4)
+                AND COALESCE(t.pfc_detailed, '') != ALL($5)
+              )
+            END
       )
     )
   )
@@ -1735,6 +1819,7 @@ app.get('/api/spend', async (req, res) => {
       return res.status(400).json({ error: 'start and end must be valid YYYY-MM-DD dates' });
     }
     const userId = req.userId;
+    const p2pExcluded = await getP2PTransfersExcluded(userId);
 
     // Independent queries (Plaid-synced transactions vs. manual expenses, different
     // tables) - run together instead of one after another.
@@ -1744,7 +1829,7 @@ app.get('/api/spend', async (req, res) => {
          WHERE t.user_id = $1
            AND t.date BETWEEN $2 AND $3
            AND ${COUNTS_TOWARD_SPEND}`,
-        [userId, start, end, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, PFC_DETAILED_P2P_OUT]
+        [userId, start, end, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, PFC_DETAILED_P2P_OUT, p2pExcluded, P2P_NAME_PATTERN]
       ),
       pool.query(
         `SELECT COALESCE(SUM(amount), 0) AS total FROM manual_expenses
@@ -1773,6 +1858,7 @@ app.get('/api/spend/daily', async (req, res) => {
       return res.status(400).json({ error: 'start and end must be valid YYYY-MM-DD dates' });
     }
     const userId = req.userId;
+    const p2pExcluded = await getP2PTransfersExcluded(userId);
 
     const result = await pool.query(
       `SELECT gs::date AS date, COALESCE(t.total, 0) + COALESCE(m.total, 0) AS spent
@@ -1789,7 +1875,7 @@ app.get('/api/spend/daily', async (req, res) => {
          GROUP BY local_date
        ) m ON m.local_date = gs::date
        ORDER BY gs`,
-      [userId, start, end, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, PFC_DETAILED_P2P_OUT]
+      [userId, start, end, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, PFC_DETAILED_P2P_OUT, p2pExcluded, P2P_NAME_PATTERN]
     );
 
     res.json(result.rows.map((r) => ({ date: toDateOnly(r.date), spent: Number(r.spent) })));

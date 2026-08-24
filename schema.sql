@@ -329,3 +329,24 @@ ALTER TABLE webhook_log ADD COLUMN IF NOT EXISTS sync_error TEXT;
 -- already deleted our side), but still queried by item_id on account/bank deletion cleanup,
 -- and this table has no retention policy - it only grows, unlike the others indexed here.
 CREATE INDEX IF NOT EXISTS idx_webhook_log_item ON webhook_log(item_id);
+
+-- Global default for every P2P transfer (Venmo/Zelle/Cash App/PayPal), both directions -
+-- for someone who genuinely never wants any of it counted (splitting bills with
+-- roommates, moving money between their own payment apps), instead of manually excluding
+-- each one. Only ever changes the DEFAULT, the same way is_recurring_bill already does for
+-- a recognized bill - a per-transaction override (transactions.user_excluded /
+-- user_income_excluded, both still tri-state) always wins over it regardless of which way
+-- it's set.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS p2p_transfers_excluded BOOLEAN NOT NULL DEFAULT false;
+
+-- user_income_excluded is now a tri-state override too, mirroring user_excluded above -
+-- NULL defers to the automatic default (a P2P-in counts as income unless
+-- users.p2p_transfers_excluded turns that default off), true always excludes it from
+-- income regardless of the global setting, false always counts it regardless. Needed a
+-- real tri-state the moment a global default could disagree with this column's own
+-- previous implicit meaning ("false = counts as income") - otherwise there was no way to
+-- tell "never touched, defer to whatever the default currently is" apart from "explicitly
+-- chose to count this one as income despite turning the global default off."
+ALTER TABLE transactions ALTER COLUMN user_income_excluded DROP DEFAULT;
+ALTER TABLE transactions ALTER COLUMN user_income_excluded DROP NOT NULL;
+UPDATE transactions SET user_income_excluded = NULL WHERE user_income_excluded = false;
