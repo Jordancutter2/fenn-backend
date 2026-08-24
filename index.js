@@ -14,7 +14,6 @@ const {
   logout,
   requireAuth,
   changePassword,
-  verifyPasswordForSensitiveAction,
   requestPasswordReset,
   resetPassword,
   setupMfa,
@@ -398,12 +397,14 @@ app.post('/api/auth/mfa/verify-login', loginLimiter, async (req, res) => {
 // cleanup here - otherwise Plaid-derived data would linger with no remaining business need.
 // loginLimiter, same reasoning as change-password/mfa-disable above - this now also
 // compares a real password via bcrypt.
+// No password re-verification here (there used to be one, verifyPasswordForSensitiveAction)
+// - the frontend now gates this behind two confirmations instead of a password (deliberate
+// product decision: an Apple-only account had no equivalent step-up at all, and the double
+// confirm at least protects against a genuine "meant to tap something else" mis-tap the
+// same way for every account, password or not). loginLimiter is still worth keeping - not
+// for a password to brute force anymore, but it still caps how fast a stolen token could be
+// used to hammer this endpoint.
 app.delete('/api/account', requireAuth, loginLimiter, async (req, res) => {
-  try {
-    await verifyPasswordForSensitiveAction(req.userId, req.body?.password);
-  } catch (err) {
-    return res.status(err.status || 401).json({ error: err.message, code: err.code });
-  }
   try {
     const items = await pool.query('SELECT access_token, plaid_item_id FROM plaid_items WHERE user_id = $1', [
       req.userId,
