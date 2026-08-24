@@ -1,7 +1,6 @@
 require('dotenv').config({ quiet: true });
 const crypto = require('crypto');
 const express = require('express');
-const cors = require('cors');
 const helmet = require('helmet');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
@@ -72,20 +71,23 @@ app.set('trust proxy', true);
 
 // Baseline security headers (X-Content-Type-Options, X-Frame-Options, a default
 // Content-Security-Policy, HSTS, etc.) on every response. The one incidental cost:
-// public/index.html (an explicitly-labeled throwaway Plaid sandbox test harness, not part
-// of the real app) loads an external Plaid CDN script and runs its own logic from inline
-// <script> tags - helmet's default CSP (script-src 'self', no unsafe-inline) blocks both,
-// so that page's buttons stop working. The real app never touches this route at all (it's
-// a native client, not a browser), so this only affects a dev-only test page reached by
-// manually visiting the backend's own root URL.
 app.use(helmet());
-app.use(cors());
+// No cors() here - the only client is the native app, which doesn't send/enforce Origin
+// headers the way a browser does, so there's no legitimate cross-origin browser caller to
+// allow in the first place. Leaving the default (same-origin only) is strictly narrower
+// than cors()'s wide-open default with no behavior change for the real app.
 // Stashes the raw request body bytes on every request (cheap - just a Buffer reference,
 // not a copy) - needed specifically to verify the Plaid webhook's signature below, which
 // requires hashing the *exact* bytes Plaid sent, not a re-serialized version of the
 // already-parsed JSON (whitespace/key-order differences would change the hash).
 app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
-app.use(express.static('public'));
+// public/index.html (an explicitly-labeled throwaway Plaid sandbox test harness, not part
+// of the real app) has no reason to be reachable once shipped - dev-only, so it's not
+// served at all in production rather than left live as free API-surface fingerprinting for
+// anyone who visits the backend's own root URL.
+if (process.env.NODE_ENV !== 'production') {
+  app.use(express.static('public'));
+}
 app.use((req, res, next) => {
   console.log(`[request] ${req.method} ${req.originalUrl}`);
   next();
@@ -1372,11 +1374,11 @@ app.get('/api/bills', async (req, res) => {
        FROM recurring_bills rb
        JOIN plaid_items pi ON pi.id = rb.plaid_item_id
        WHERE rb.user_id = $1 AND rb.is_active = true AND rb.average_amount > 0
-         AND rb.last_date >= pi.created_at::date - interval '${DATA_IMPORT_LOOKBACK_DAYS} days'
-         AND COALESCE(rb.pfc_primary, '') != ALL($2)
-         AND COALESCE(rb.pfc_detailed, '') != ALL($3)
+         AND rb.last_date >= pi.created_at::date - make_interval(days => $2)
+         AND COALESCE(rb.pfc_primary, '') != ALL($3)
+         AND COALESCE(rb.pfc_detailed, '') != ALL($4)
        ORDER BY rb.average_amount DESC`,
-      [userId, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED]
+      [userId, DATA_IMPORT_LOOKBACK_DAYS, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED]
     );
     res.json(result.rows);
   } catch (err) {

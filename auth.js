@@ -651,8 +651,8 @@ async function requireAuth(req, res, next) {
 
   const result = await pool.query(
     `SELECT user_id, mfa_verified FROM sessions
-     WHERE token = $1 AND last_used_at > now() - interval '${SESSION_LIFETIME_DAYS} days'`,
-    [tokenHash]
+     WHERE token = $1 AND last_used_at > now() - make_interval(days => $2)`,
+    [tokenHash, SESSION_LIFETIME_DAYS]
   );
   if (result.rows.length === 0) return res.status(401).json({ error: 'Not authenticated', code: 'SESSION_INVALID' });
 
@@ -669,8 +669,8 @@ async function requireAuth(req, res, next) {
   pool
     .query(
       `UPDATE sessions SET last_used_at = now()
-       WHERE token = $1 AND last_used_at < now() - interval '${SESSION_REFRESH_THRESHOLD_DAYS} days'`,
-      [tokenHash]
+       WHERE token = $1 AND last_used_at < now() - make_interval(days => $2)`,
+      [tokenHash, SESSION_REFRESH_THRESHOLD_DAYS]
     )
     .catch((err) => console.error('Failed to refresh session last_used_at:', err));
 
