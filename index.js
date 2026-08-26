@@ -127,6 +127,30 @@ app.get('/terms', (req, res) => {
   res.send(renderLegalDocHtml(TERMS_OF_SERVICE));
 });
 
+// App Store Connect requires a real Support URL (not a mailto: link) before a version can
+// be submitted for review - same "no separate marketing site" reasoning as /privacy and
+// /terms above, so this is a minimal page rather than a whole support site.
+app.get('/support', (req, res) => {
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fenn Support</title>
+<style>
+  body { font-family: -apple-system, Helvetica, Arial, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; color: #1a1a1a; line-height: 1.6; }
+  h1 { font-size: 24px; }
+  p { font-size: 14px; color: #333; }
+  a { color: #2b6e63; }
+</style>
+</head>
+<body>
+<h1>Fenn Support</h1>
+<p>Questions, feedback, or an issue with the app? Email us at <a href="mailto:jordan.cutter@yahoo.com">jordan.cutter@yahoo.com</a> and we'll get back to you.</p>
+</body>
+</html>`);
+});
+
 // Bcrypt's own cost factor already slows down a single guess, but that's not the same as
 // capping how many guesses an attacker gets - without this, nothing stops a sustained
 // brute-force run against a specific email over hours. Keyed by IP, not by email, so it
