@@ -172,6 +172,16 @@ const webhookLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// RevenueCat's own webhook-sending traffic isn't a guessable secret per IP the way login
+// is - same "generous, not tight" reasoning as webhookLimiter above, just a separate
+// limiter so the two integrations' traffic never share a bucket.
+const revenueCatWebhookLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // node-postgres parses DATE columns into JS Date objects using the *local* timezone of
 // this process, not UTC. Reading the date back out with local getters (not toISOString,
 // which is UTC) correctly reverses that regardless of what timezone this server runs in.
@@ -652,6 +662,112 @@ app.post('/plaid-webhook', webhookLimiter, async (req, res) => {
     } catch (err) {
       console.error(`[plaid webhook] failed to flag item ${item_id} for new accounts:`, err.message);
     }
+  }
+
+  res.sendStatus(200);
+});
+
+// RevenueCat's webhook auth model is a plain shared secret in the Authorization header
+// (set when configuring the webhook in RevenueCat's dashboard) - not a signed JWT/JWKS
+// like Plaid's above, so there's no key-rotation dance needed, just a constant-time
+// comparison against process.env.REVENUECAT_WEBHOOK_SECRET.
+function verifyRevenueCatWebhook(req) {
+  const expected = process.env.REVENUECAT_WEBHOOK_SECRET;
+  if (!expected) throw new Error('REVENUECAT_WEBHOOK_SECRET not configured');
+  const provided = req.headers.authorization || '';
+  const providedSecret = provided.startsWith('Bearer ') ? provided.slice(7) : provided;
+  const expectedBuf = Buffer.from(expected);
+  const providedBuf = Buffer.from(providedSecret);
+  // timingSafeEqual requires equal-length buffers and throws otherwise - comparing length
+  // first just avoids that throw; a secret's length isn't itself sensitive here.
+  if (expectedBuf.length !== providedBuf.length || !crypto.timingSafeEqual(expectedBuf, providedBuf)) {
+    throw new Error('invalid RevenueCat webhook secret');
+  }
+}
+
+// Public (no requireAuth) for the same reason /plaid-webhook is - RevenueCat calls this
+// directly, no Fenn user session exists. app_user_id in every event IS Fenn's own numeric
+// users.id, passed straight through as a string by Purchases.configure() (app/purchases.js)
+// when the app knows who's logged in - no separate RevenueCat-id-to-Fenn-id mapping table
+// needed as a result.
+app.post('/revenuecat-webhook', revenueCatWebhookLimiter, async (req, res) => {
+  try {
+    verifyRevenueCatWebhook(req);
+  } catch (err) {
+    console.error('[revenuecat webhook] rejected:', err.message);
+    return res.sendStatus(401);
+  }
+
+  const event = req.body?.event || {};
+  const { type: eventType, app_user_id: appUserId, id: eventId } = event;
+  console.log(`[revenuecat webhook] ${eventType} for app_user_id ${appUserId}`);
+
+  let logId = null;
+  try {
+    const inserted = await pool.query(
+      `INSERT INTO revenuecat_webhook_log (event_type, app_user_id, event_id, payload)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (event_id) WHERE event_id IS NOT NULL DO NOTHING
+       RETURNING id`,
+      [eventType, appUserId, eventId, JSON.stringify(req.body)]
+    );
+    if (inserted.rows.length === 0) {
+      console.log(`[revenuecat webhook] duplicate delivery of event ${eventId}, skipping`);
+      return res.sendStatus(200);
+    }
+    logId = inserted.rows[0].id;
+  } catch (err) {
+    console.error('Failed to log RevenueCat webhook', err);
+  }
+
+  const userId = /^\d+$/.test(String(appUserId)) ? Number(appUserId) : null;
+  if (!userId) {
+    console.error(`[revenuecat webhook] non-numeric app_user_id: ${appUserId}`);
+    if (logId) await pool.query('UPDATE revenuecat_webhook_log SET result = $1 WHERE id = $2', ['INVALID_APP_USER_ID', logId]);
+    return res.sendStatus(200); // acknowledge - retrying won't fix a malformed id
+  }
+
+  // Deliberately conservative: only the event types below ever change tier. Everything
+  // else (PRODUCT_CHANGE, TRANSFER, SUBSCRIPTION_PAUSED, NON_RENEWING_PURCHASE, TEST, etc.)
+  // is acknowledged and logged, but left alone - better to no-op on an event type this
+  // code has no confident mapping for than guess wrong on a paying user's access.
+  let newTier;
+  switch (eventType) {
+    case 'INITIAL_PURCHASE':
+    case 'RENEWAL':
+    case 'UNCANCELLATION': // user turned auto-renew back on before the period lapsed
+      newTier = 'paid';
+      break;
+    case 'EXPIRATION':
+      newTier = 'free';
+      break;
+    case 'CANCELLATION':
+      // Auto-renew turned off, but per RevenueCat's own docs the current paid period is
+      // still active - access continues until a later EXPIRATION actually arrives. Logged
+      // above for audit visibility; deliberately not a tier change here.
+      break;
+    case 'BILLING_ISSUE':
+      // A renewal charge failed - Apple/RevenueCat retries during a grace period, during
+      // which the entitlement (and this account's paid tier) should keep working. Only a
+      // subsequent EXPIRATION (grace period exhausted) should downgrade.
+      break;
+    default:
+      break;
+  }
+
+  try {
+    let result = 'OK';
+    if (newTier) {
+      const updated = await pool.query('UPDATE users SET tier = $1 WHERE id = $2', [newTier, userId]);
+      if (updated.rowCount === 0) result = 'NO_MATCHING_USER';
+      else console.log(`[revenuecat webhook] user ${userId} tier -> ${newTier} (${eventType})`);
+    }
+    if (logId) await pool.query('UPDATE revenuecat_webhook_log SET result = $1 WHERE id = $2', [result, logId]);
+  } catch (err) {
+    console.error(`[revenuecat webhook] failed to apply ${eventType} for user ${userId}:`, err.message);
+    if (logId) await pool.query('UPDATE revenuecat_webhook_log SET result = $1 WHERE id = $2', [err.message, logId]);
+    return res.sendStatus(500); // a real 5xx is correct here - RevenueCat retries, which is
+                                  // exactly what a transient DB error needs.
   }
 
   res.sendStatus(200);

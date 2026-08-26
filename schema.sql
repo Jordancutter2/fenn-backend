@@ -350,3 +350,38 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS p2p_transfers_excluded BOOLEAN NOT NU
 ALTER TABLE transactions ALTER COLUMN user_income_excluded DROP DEFAULT;
 ALTER TABLE transactions ALTER COLUMN user_income_excluded DROP NOT NULL;
 UPDATE transactions SET user_income_excluded = NULL WHERE user_income_excluded = false;
+
+-- tier is now driven by a real code path (RevenueCat's webhook, see /revenuecat-webhook
+-- below) instead of only ever being hand-set for testing - worth a real value constraint
+-- now that something automated writes it. A CHECK, not a Postgres ENUM: an ENUM needs
+-- ALTER TYPE ... ADD VALUE to add a third tier later, more ceremony than this file's
+-- existing idempotent-ALTER convention - a CHECK drops in the same way every other
+-- constraint here already does, and is just as strict. Verified live against production
+-- before adding this: only 'free'/'paid' currently exist, nothing to clean up first.
+ALTER TABLE users DROP CONSTRAINT IF EXISTS users_tier_check;
+ALTER TABLE users ADD CONSTRAINT users_tier_check CHECK (tier IN ('free', 'paid'));
+
+-- Every webhook RevenueCat ever sends - parallel to webhook_log above (Plaid), but for a
+-- place real money changes hands, so it's worth reconstructing after the fact even though
+-- (unlike webhook_log) most event types here DO immediately drive a real tier change
+-- rather than just logging. app_user_id is RevenueCat's own subscriber identifier - since
+-- the app hands users.id straight to Purchases.configure() as the app_user_id, this
+-- doubles as our own users.id in text form, but is deliberately NOT a foreign key: a
+-- webhook can legitimately reference a user who has since deleted their Fenn account
+-- (account deletion has no reason to reach out to RevenueCat first), and this table must
+-- still record the event rather than fail the whole webhook.
+CREATE TABLE IF NOT EXISTS revenuecat_webhook_log (
+  id SERIAL PRIMARY KEY,
+  received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  event_type TEXT,
+  app_user_id TEXT,
+  event_id TEXT,
+  payload JSONB,
+  result TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_revenuecat_webhook_log_app_user ON revenuecat_webhook_log(app_user_id);
+-- RevenueCat can and does redeliver the same event (our endpoint timing out, a transient
+-- 5xx) - this partial unique index lets the handler's ON CONFLICT DO NOTHING make a
+-- redelivery a no-op instead of silently reapplying a tier change or double-logging one
+-- event as two.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_revenuecat_webhook_log_event_id ON revenuecat_webhook_log(event_id) WHERE event_id IS NOT NULL;
