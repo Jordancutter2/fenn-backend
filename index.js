@@ -752,14 +752,20 @@ app.post('/revenuecat-webhook', revenueCatWebhookLimiter, async (req, res) => {
   }
 
   // Deliberately conservative: only the event types below ever change tier. Everything
-  // else (PRODUCT_CHANGE, TRANSFER, SUBSCRIPTION_PAUSED, NON_RENEWING_PURCHASE, TEST, etc.)
-  // is acknowledged and logged, but left alone - better to no-op on an event type this
-  // code has no confident mapping for than guess wrong on a paying user's access.
+  // else (TRANSFER, SUBSCRIPTION_PAUSED, NON_RENEWING_PURCHASE, TEST, etc.) is acknowledged
+  // and logged, but left alone - better to no-op on an event type this code has no
+  // confident mapping for than guess wrong on a paying user's access.
   let newTier;
   switch (eventType) {
     case 'INITIAL_PURCHASE':
     case 'RENEWAL':
     case 'UNCANCELLATION': // user turned auto-renew back on before the period lapsed
+    // Confirmed live: RevenueCat sends this switching between monthly/annual on the same
+    // entitlement - can only ever fire for someone who already has an active paid
+    // subscription (there's no "product" to change on a free account), so it's just as
+    // safe to explicitly confirm paid here as to rely on tier already being correct from
+    // an earlier event.
+    case 'PRODUCT_CHANGE':
       newTier = 'paid';
       break;
     case 'EXPIRATION':
