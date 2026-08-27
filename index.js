@@ -1068,13 +1068,19 @@ async function syncOneItem(item, userId) {
     cursor = response.data.next_cursor;
   }
 
-  for (const txn of added.concat(modified)) {
-    if (txn.date < importStartDateKey) continue;
-    const pfc = txn.personal_finance_category || {};
+  // One batched upsert via unnest(), not one query per transaction - a first-time bank
+  // link backfilling DATA_IMPORT_LOOKBACK_DAYS can easily mean 100-400 added/modified rows,
+  // which was 100-400 serial round-trips to Neon before this (confirmed via a performance
+  // audit, not a hypothetical - items already sync in parallel via Promise.allSettled at
+  // the call site, but each one's own insert loop was still fully serial internally).
+  const toUpsert = added.concat(modified).filter((txn) => txn.date >= importStartDateKey);
+  if (toUpsert.length > 0) {
     await pool.query(
       `INSERT INTO transactions
          (plaid_item_id, user_id, plaid_transaction_id, account_id, amount, iso_currency_code, date, name, merchant_name, pending, pfc_primary, pfc_detailed, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
+       SELECT $1::integer, $2::integer, u.*, now()
+       FROM unnest($3::text[], $4::text[], $5::numeric[], $6::text[], $7::date[], $8::text[], $9::text[], $10::boolean[], $11::text[], $12::text[])
+         AS u(plaid_transaction_id, account_id, amount, iso_currency_code, date, name, merchant_name, pending, pfc_primary, pfc_detailed)
        ON CONFLICT (plaid_transaction_id) DO UPDATE SET
          amount = EXCLUDED.amount,
          date = EXCLUDED.date,
@@ -1087,16 +1093,16 @@ async function syncOneItem(item, userId) {
       [
         item.id,
         userId,
-        txn.transaction_id,
-        txn.account_id,
-        txn.amount,
-        txn.iso_currency_code,
-        txn.date,
-        txn.name,
-        txn.merchant_name,
-        txn.pending,
-        pfc.primary || null,
-        pfc.detailed || null,
+        toUpsert.map((t) => t.transaction_id),
+        toUpsert.map((t) => t.account_id),
+        toUpsert.map((t) => t.amount),
+        toUpsert.map((t) => t.iso_currency_code),
+        toUpsert.map((t) => t.date),
+        toUpsert.map((t) => t.name),
+        toUpsert.map((t) => t.merchant_name),
+        toUpsert.map((t) => t.pending),
+        toUpsert.map((t) => t.personal_finance_category?.primary || null),
+        toUpsert.map((t) => t.personal_finance_category?.detailed || null),
       ]
     );
   }
