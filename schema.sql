@@ -385,3 +385,11 @@ CREATE INDEX IF NOT EXISTS idx_revenuecat_webhook_log_app_user ON revenuecat_web
 -- redelivery a no-op instead of silently reapplying a tier change or double-logging one
 -- event as two.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_revenuecat_webhook_log_event_id ON revenuecat_webhook_log(event_id) WHERE event_id IS NOT NULL;
+
+-- Set when a BILLING_ISSUE webhook fires (Apple's renewal charge failed and is being
+-- retried during the grace period) - tier stays 'paid' through this, matching Apple's own
+-- grace-period behavior, but until now the user had zero signal anything was wrong and
+-- would only find out once it silently expired. NULL means no known issue. Cleared back to
+-- NULL by any event that confirms the subscription is actually fine again (a successful
+-- RENEWAL, etc.) or that's already moot (EXPIRATION - they're downgraded either way).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS billing_issue_since TIMESTAMPTZ;

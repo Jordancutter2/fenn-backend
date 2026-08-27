@@ -306,7 +306,9 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   // decide whether "Change password" makes sense to show at all - an Apple-only account
   // has no password to change.
   const result = await pool.query(
-    'SELECT id, email, tier, created_at, (password_hash IS NOT NULL) AS has_password, mfa_enabled FROM users WHERE id = $1',
+    `SELECT id, email, tier, created_at, (password_hash IS NOT NULL) AS has_password, mfa_enabled,
+            (billing_issue_since IS NOT NULL) AS billing_issue
+     FROM users WHERE id = $1`,
     [req.userId]
   );
   res.json(result.rows[0] || null);
@@ -758,7 +760,9 @@ app.post('/revenuecat-webhook', revenueCatWebhookLimiter, async (req, res) => {
     const toIds = (event.transferred_to || []).map(Number).filter(Number.isInteger);
     const fromIds = (event.transferred_from || []).map(Number).filter(Number.isInteger);
     try {
-      if (toIds.length) await pool.query('UPDATE users SET tier = $1 WHERE id = ANY($2)', ['paid', toIds]);
+      if (toIds.length) {
+        await pool.query('UPDATE users SET tier = $1, billing_issue_since = NULL WHERE id = ANY($2)', ['paid', toIds]);
+      }
       if (fromIds.length) await pool.query('UPDATE users SET tier = $1 WHERE id = ANY($2)', ['free', fromIds]);
       console.log(`[revenuecat webhook] transferred entitlement: from [${fromIds}] to [${toIds}]`);
       if (logId) await pool.query('UPDATE revenuecat_webhook_log SET result = $1 WHERE id = $2', ['OK', logId]);
@@ -781,6 +785,10 @@ app.post('/revenuecat-webhook', revenueCatWebhookLimiter, async (req, res) => {
   // else (SUBSCRIPTION_PAUSED, NON_RENEWING_PURCHASE, TEST, etc.) is acknowledged and
   // logged, but left alone - better to no-op on an event type this code has no confident
   // mapping for than guess wrong on a paying user's access.
+  // Every event below that confirms tier one way or the other also clears
+  // billing_issue_since directly in its own UPDATE (see the try block) - whatever was
+  // flagged is no longer accurate either way, since the charge that was retrying either
+  // succeeded or the subscription's fully gone regardless.
   let newTier;
   switch (eventType) {
     case 'INITIAL_PURCHASE':
@@ -804,8 +812,11 @@ app.post('/revenuecat-webhook', revenueCatWebhookLimiter, async (req, res) => {
       break;
     case 'BILLING_ISSUE':
       // A renewal charge failed - Apple/RevenueCat retries during a grace period, during
-      // which the entitlement (and this account's paid tier) should keep working. Only a
-      // subsequent EXPIRATION (grace period exhausted) should downgrade.
+      // which the entitlement (and this account's paid tier) should keep working. Tier
+      // doesn't change, but this is the one case the user should actually be told about -
+      // "card expired" is one of the most common, most recoverable causes of subscription
+      // churn, and silence here just means they find out once it's already too late
+      // (EXPIRATION, with no warning first).
       break;
     default:
       break;
@@ -814,9 +825,21 @@ app.post('/revenuecat-webhook', revenueCatWebhookLimiter, async (req, res) => {
   try {
     let result = 'OK';
     if (newTier) {
-      const updated = await pool.query('UPDATE users SET tier = $1 WHERE id = $2', [newTier, userId]);
+      const updated = await pool.query(
+        'UPDATE users SET tier = $1, billing_issue_since = NULL WHERE id = $2',
+        [newTier, userId]
+      );
       if (updated.rowCount === 0) result = 'NO_MATCHING_USER';
       else console.log(`[revenuecat webhook] user ${userId} tier -> ${newTier} (${eventType})`);
+    } else if (eventType === 'BILLING_ISSUE') {
+      const updated = await pool.query(
+        'UPDATE users SET billing_issue_since = now() WHERE id = $1 AND billing_issue_since IS NULL',
+        [userId]
+      );
+      // rowCount 0 here just as often means "already flagged from an earlier retry" as
+      // "no matching user" - not worth distinguishing for a field that's purely
+      // informational, unlike tier itself.
+      console.log(`[revenuecat webhook] user ${userId} flagged billing_issue_since (${updated.rowCount} row(s))`);
     }
     if (logId) await pool.query('UPDATE revenuecat_webhook_log SET result = $1 WHERE id = $2', [result, logId]);
   } catch (err) {
@@ -1088,8 +1111,12 @@ async function syncOneItem(item, userId) {
   return { added: added.length, modified: modified.length, removed: removed.length };
 }
 
-// Step 3: pull transactions for every bank connection this user has.
-app.post('/api/sync_transactions', async (req, res) => {
+// Step 3: pull transactions for every bank connection this user has. requirePaidTier here
+// too, not just on linking a new bank - a lapsed subscriber keeps their already-synced data
+// fully intact and readable, but shouldn't keep pulling in new transactions for free. A
+// deliberate product decision (confirmed 2026-08-27), not the default this endpoint
+// launched with.
+app.post('/api/sync_transactions', requirePaidTier, async (req, res) => {
   try {
     const userId = req.userId;
     // Excludes items already flagged needs_reconnect - a broken Item's access_token is
@@ -1373,7 +1400,8 @@ app.get('/api/plaid_items', async (req, res) => {
 // Fetches recurring transaction streams from Plaid for every linked bank and stores the
 // outflow ones (recurring bills - rent, subscriptions, utilities). Not called on every
 // regular sync; it's a heavier Plaid call, meant to be triggered when the Bills view loads.
-app.post('/api/sync_recurring', async (req, res) => {
+// requirePaidTier - same reasoning as /api/sync_transactions above.
+app.post('/api/sync_recurring', requirePaidTier, async (req, res) => {
   try {
     const userId = req.userId;
     // Same needs_reconnect exclusion as sync_transactions - a broken Item is guaranteed to
