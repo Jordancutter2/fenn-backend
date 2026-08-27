@@ -1577,7 +1577,16 @@ app.get('/api/bills', async (req, res) => {
       // parseDateKey splits on '-' expecting a plain 'YYYY-MM-DD' string - fed that ISO
       // string instead, it silently produces an Invalid Date (confirmed live: this was
       // showing "last Invalid Date - next ~Invalid Date" for every bill).
-      `SELECT rb.id, rb.merchant_name, rb.description, rb.average_amount, rb.last_amount, rb.frequency, to_char(rb.last_date, 'YYYY-MM-DD') AS last_date, rb.is_active, rb.user_included, rb.pfc_primary, rb.previous_amount
+      // display_amount, not a bare rb.average_amount - Plaid's own average is a blend over
+      // the stream's whole history, so right after a real price increase it stays stale
+      // (well under the new real cost) for a while, which is exactly the moment accuracy
+      // matters most (confirmed via a financial-correctness audit - not hypothetical).
+      // While previous_amount is set (an increase is flagged and not yet acknowledged -
+      // see acknowledgeBillPriceIncrease, which clears it back to NULL), this shows the
+      // known-current last_amount instead; once acknowledged, it reverts to trusting
+      // Plaid's own average again, which by then should have caught up.
+      `SELECT rb.id, rb.merchant_name, rb.description, rb.average_amount, rb.last_amount, rb.frequency, to_char(rb.last_date, 'YYYY-MM-DD') AS last_date, rb.is_active, rb.user_included, rb.pfc_primary, rb.previous_amount,
+              CASE WHEN rb.previous_amount IS NOT NULL THEN rb.last_amount ELSE rb.average_amount END AS display_amount
        FROM recurring_bills rb
        JOIN plaid_items pi ON pi.id = rb.plaid_item_id
        WHERE rb.user_id = $1 AND rb.is_active = true AND rb.average_amount > 0
