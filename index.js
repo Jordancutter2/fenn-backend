@@ -723,7 +723,12 @@ app.post('/revenuecat-webhook', revenueCatWebhookLimiter, async (req, res) => {
   }
 
   const event = req.body?.event || {};
-  const { type: eventType, app_user_id: appUserId, id: eventId } = event;
+  const { type: eventType, id: eventId } = event;
+  // TRANSFER has no single app_user_id - confirmed against RevenueCat's own webhook
+  // reference: the entitlement moves between two arrays instead, transferred_from and
+  // transferred_to. Every other event type keys off one app_user_id normally.
+  const isTransfer = eventType === 'TRANSFER';
+  const appUserId = isTransfer ? (event.transferred_to || []).join(',') || null : event.app_user_id;
   console.log(`[revenuecat webhook] ${eventType} for app_user_id ${appUserId}`);
 
   let logId = null;
@@ -744,6 +749,27 @@ app.post('/revenuecat-webhook', revenueCatWebhookLimiter, async (req, res) => {
     console.error('Failed to log RevenueCat webhook', err);
   }
 
+  // Confirmed live: deleting a Fenn account and creating a new one under the same Apple
+  // ID/subscription sends this - the still-active receipt moves to the new account's
+  // app_user_id. Handled separately from the switch below since it touches both sides of
+  // the move (the new account gains paid, the old one - if it still exists at all - loses
+  // it) rather than a single id gaining or losing tier.
+  if (isTransfer) {
+    const toIds = (event.transferred_to || []).map(Number).filter(Number.isInteger);
+    const fromIds = (event.transferred_from || []).map(Number).filter(Number.isInteger);
+    try {
+      if (toIds.length) await pool.query('UPDATE users SET tier = $1 WHERE id = ANY($2)', ['paid', toIds]);
+      if (fromIds.length) await pool.query('UPDATE users SET tier = $1 WHERE id = ANY($2)', ['free', fromIds]);
+      console.log(`[revenuecat webhook] transferred entitlement: from [${fromIds}] to [${toIds}]`);
+      if (logId) await pool.query('UPDATE revenuecat_webhook_log SET result = $1 WHERE id = $2', ['OK', logId]);
+    } catch (err) {
+      console.error('[revenuecat webhook] failed to apply TRANSFER:', err.message);
+      if (logId) await pool.query('UPDATE revenuecat_webhook_log SET result = $1 WHERE id = $2', [err.message, logId]);
+      return res.sendStatus(500);
+    }
+    return res.sendStatus(200);
+  }
+
   const userId = /^\d+$/.test(String(appUserId)) ? Number(appUserId) : null;
   if (!userId) {
     console.error(`[revenuecat webhook] non-numeric app_user_id: ${appUserId}`);
@@ -752,9 +778,9 @@ app.post('/revenuecat-webhook', revenueCatWebhookLimiter, async (req, res) => {
   }
 
   // Deliberately conservative: only the event types below ever change tier. Everything
-  // else (TRANSFER, SUBSCRIPTION_PAUSED, NON_RENEWING_PURCHASE, TEST, etc.) is acknowledged
-  // and logged, but left alone - better to no-op on an event type this code has no
-  // confident mapping for than guess wrong on a paying user's access.
+  // else (SUBSCRIPTION_PAUSED, NON_RENEWING_PURCHASE, TEST, etc.) is acknowledged and
+  // logged, but left alone - better to no-op on an event type this code has no confident
+  // mapping for than guess wrong on a paying user's access.
   let newTier;
   switch (eventType) {
     case 'INITIAL_PURCHASE':
