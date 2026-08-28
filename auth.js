@@ -524,32 +524,58 @@ async function confirmMfa(userId, code) {
     throw err;
   }
 
-  await pool.query(
-    'UPDATE users SET mfa_secret = $1, mfa_pending_secret = NULL, mfa_enabled = true WHERE id = $2',
-    [encryptedSecret, userId]
-  );
-
-  await pool.query('DELETE FROM mfa_backup_codes WHERE user_id = $1', [userId]);
+  // Backup codes generated/hashed before the transaction even opens - bcrypt.hash is slow
+  // on purpose (that's the whole point of it), and there's no reason to hold a DB
+  // transaction open across 8 of them run sequentially.
   const backupCodes = [];
+  const codeHashes = [];
   for (let i = 0; i < BACKUP_CODE_COUNT; i++) {
     const backupCode = generateBackupCode();
     backupCodes.push(backupCode);
-    const hash = await bcrypt.hash(backupCode, 10);
-    await pool.query('INSERT INTO mfa_backup_codes (user_id, code_hash) VALUES ($1, $2)', [userId, hash]);
+    codeHashes.push(await bcrypt.hash(backupCode, 10));
   }
+
+  // One transaction, not three separately-committed statements - a crash partway through
+  // (rare, but real - Railway restarts/deploys happen) used to be able to leave MFA
+  // enabled with zero or only some backup codes actually stored, while the caller's own
+  // request had already failed and shown "setup failed" - so the user believes it didn't
+  // work and is never shown the codes that DID get saved, then gets locked out by an MFA
+  // prompt on their next login with backup codes they never saw. Confirmed via a
+  // correctness audit, same class of bug changePassword's own transaction already guards
+  // against for a different pair of statements.
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      'UPDATE users SET mfa_secret = $1, mfa_pending_secret = NULL, mfa_enabled = true WHERE id = $2',
+      [encryptedSecret, userId]
+    );
+    await client.query('DELETE FROM mfa_backup_codes WHERE user_id = $1', [userId]);
+    for (const hash of codeHashes) {
+      await client.query('INSERT INTO mfa_backup_codes (user_id, code_hash) VALUES ($1, $2)', [userId, hash]);
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+
   return { backupCodes };
 }
 
 // Requires the current password (not just being logged in) so a hijacked but not-yet-MFA'd
 // session can't turn off the one thing standing between it and full account takeover.
+// verifyPasswordForSensitiveAction, not its own inline check - an Apple-only account (no
+// password_hash) has no password to ever verify, and this used to unconditionally require
+// one anyway. Confirmed via a correctness audit: that was a real, permanent lockout - an
+// Apple-only user who enabled MFA had no self-service way to ever turn it off again
+// (requestPasswordReset is also a no-op with no password to reset), with account deletion
+// as the only escape. Same no-op-for-Apple-only precedent this function's own sibling
+// (account deletion) already uses.
 async function disableMfa(userId, password) {
-  const result = await pool.query('SELECT password_hash FROM users WHERE id = $1', [userId]);
-  const user = result.rows[0];
-  if (!user || !user.password_hash || !(await bcrypt.compare(password, user.password_hash))) {
-    const err = new Error('Current password is incorrect.');
-    err.status = 401;
-    throw err;
-  }
+  await verifyPasswordForSensitiveAction(userId, password);
 
   await pool.query(
     'UPDATE users SET mfa_enabled = false, mfa_secret = NULL, mfa_pending_secret = NULL WHERE id = $1',
