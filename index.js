@@ -220,7 +220,13 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
-    const { email, password, marketing_consent, tos_accepted } = req.body;
+    const { email: emailInput, password, marketing_consent, tos_accepted } = req.body;
+    // Trimmed before the regex, not after - EMAIL_RE's [^\s@]+ rejects whitespace anywhere
+    // in the string, so a stray leading/trailing space (a real, plausible paste artifact
+    // from an email client or browser autofill) was rejected as "invalid" here even though
+    // register() below would have happily accepted it via its own normalizeEmail trim.
+    // Confirmed via a correctness audit.
+    const email = typeof emailInput === 'string' ? emailInput.trim() : emailInput;
     if (!email || !EMAIL_RE.test(email)) {
       return res.status(400).json({ error: 'A valid email is required.' });
     }
@@ -1409,7 +1415,17 @@ app.get('/api/search', async (req, res) => {
       ),
     ]);
 
-    res.json({ transactions: txns.rows, manual: manual.rows });
+    // Hitting the LIMIT exactly is a cheap, good-enough signal that there may be more rows
+    // past it, without a second COUNT(*) query just to render one caption - previously
+    // there was no signal at all, so a common search term against a long history silently
+    // showed only the 50 most recent matches with nothing telling the client that older
+    // ones exist and got cut off. Confirmed via a correctness audit.
+    res.json({
+      transactions: txns.rows,
+      manual: manual.rows,
+      transactionsTruncated: txns.rows.length === 50,
+      manualTruncated: manual.rows.length === 50,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Search failed' });
@@ -1930,6 +1946,15 @@ app.post('/api/expenses', async (req, res) => {
     if (typeof note === 'string' && note.length > NOTE_MAX_LENGTH) {
       return res.status(400).json({ error: `note must be ${NOTE_MAX_LENGTH} characters or fewer` });
     }
+    // Same class of gap as local_date above, just for occurred_at - currently unreachable
+    // through the app's own UI (it always sends either nothing, defaulting to now() below
+    // via COALESCE, or a well-formed timestamp it built itself), so this is hardening
+    // against a malformed direct API call rather than a live bug. Without it, a garbage
+    // value fell through to Postgres's own type-cast error, caught by the generic handler
+    // below as a bare 500 instead of a clean 400. Confirmed via a correctness audit.
+    if (occurred_at != null && Number.isNaN(new Date(occurred_at).getTime())) {
+      return res.status(400).json({ error: 'occurred_at must be a valid timestamp' });
+    }
     const userId = req.userId;
     const result = await pool.query(
       // to_char on the RETURNING clause too, not just GET /api/expenses's own SELECT -
@@ -2163,7 +2188,14 @@ app.get('/api/spend/earliest-date', async (req, res) => {
 // regular middleware.
 app.use((err, req, res, next) => {
   console.error(err);
-  res.status(500).json({ error: 'Internal error' });
+  // err.status/err.message/err.code when present, not an unconditional 500/"Internal
+  // error" - same pattern every route's own catch block above already uses. This handler
+  // mainly exists for genuinely unexpected failures (a DB connection blip, a bug), which
+  // correctly have neither and fall through to the generic response - but a route that
+  // ever ends up missing its own try/catch (an easy mistake in a file this size) would
+  // otherwise have its deliberately-set status/message/code silently discarded here too,
+  // on top of already missing its intended catch. Confirmed via a correctness audit.
+  res.status(err.status || 500).json({ error: err.status ? err.message : 'Internal error', code: err.code });
 });
 
 const PORT = process.env.PORT || 8000;
