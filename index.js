@@ -1407,6 +1407,50 @@ app.get('/api/plaid_items', async (req, res) => {
 // outflow ones (recurring bills - rent, subscriptions, utilities). Not called on every
 // regular sync; it's a heavier Plaid call, meant to be triggered when the Bills view loads.
 // requirePaidTier - same reasoning as /api/sync_transactions above.
+// TEMPORARY diagnostic route - added to directly inspect what Plaid's own
+// transactionsRecurringGet actually returns for a real account (vs guessing from this
+// file's own processing logic), to debug why fewer recurring bills show up than expected.
+// requireAuth-scoped like everything else - only ever returns the calling user's own data,
+// never a broader credential. Delete this route once the investigation is done.
+app.get('/api/debug/recurring-raw', async (req, res) => {
+  try {
+    const userId = req.userId;
+    const items = await pool.query(
+      'SELECT id, institution_name, access_token FROM plaid_items WHERE user_id = $1',
+      [userId]
+    );
+    const results = [];
+    for (const item of items.rows) {
+      try {
+        const response = await plaidClient.transactionsRecurringGet({
+          access_token: decryptToken(item.access_token),
+        });
+        results.push({
+          institution: item.institution_name,
+          outflow_count: response.data.outflow_streams.length,
+          outflow_streams: response.data.outflow_streams.map((s) => ({
+            merchant_name: s.merchant_name,
+            description: s.description,
+            average_amount: s.average_amount?.amount,
+            frequency: s.frequency,
+            is_active: s.is_active,
+            status: s.status,
+            last_date: s.last_date,
+            category: s.personal_finance_category?.primary,
+            transaction_count: s.transaction_ids?.length,
+          })),
+        });
+      } catch (err) {
+        results.push({ institution: item.institution_name, error: plaidErrorDetail(err) });
+      }
+    }
+    res.json(results);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'debug route failed' });
+  }
+});
+
 app.post('/api/sync_recurring', requirePaidTier, async (req, res) => {
   try {
     const userId = req.userId;
