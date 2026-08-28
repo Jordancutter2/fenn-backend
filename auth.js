@@ -658,13 +658,20 @@ async function verifyMfaLogin(token, code) {
     return { user };
   }
 
-  // Not a valid TOTP code - fall back to checking unused backup codes.
+  // Not a valid TOTP code - fall back to checking unused backup codes. Uppercased to match
+  // generateBackupCode's own format (hex, always generated/hashed uppercase) - the login
+  // field's autoCapitalize="characters" is only a soft on-screen-keyboard hint and does
+  // nothing for a pasted or autofilled value, so a genuinely correct code typed or pasted in
+  // lowercase was silently rejected as "incorrect." Confirmed via a correctness audit - the
+  // worst possible moment for a case-sensitivity gotcha, since backup codes exist
+  // specifically for "I lost my authenticator device."
+  const normalizedCode = String(code).trim().toUpperCase();
   const backupCodes = await pool.query(
     'SELECT id, code_hash FROM mfa_backup_codes WHERE user_id = $1 AND used_at IS NULL',
     [row.user_id]
   );
   for (const backupCode of backupCodes.rows) {
-    if (await bcrypt.compare(code, backupCode.code_hash)) {
+    if (await bcrypt.compare(normalizedCode, backupCode.code_hash)) {
       await pool.query('UPDATE mfa_backup_codes SET used_at = now() WHERE id = $1', [backupCode.id]);
       await pool.query('UPDATE sessions SET mfa_verified = true WHERE id = $1', [row.session_id]);
       return { user };
