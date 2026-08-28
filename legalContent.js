@@ -62,7 +62,7 @@ const TERMS_OF_SERVICE = {
     },
     {
       heading: 'Subscriptions',
-      body: 'Some features require a paid subscription. Pricing, billing cycle, and cancellation terms are presented at the time of purchase.',
+      body: "Fenn Plus unlocks automatic bank-linked transaction tracking, income and recurring-bill detection, and price-increase alerts. It's offered as a monthly subscription ($5.99/month) or an annual subscription ($50/year), billed through your Apple Account. Payment is charged at the time of purchase, and each subscription automatically renews for the same length and price unless auto-renew is turned off at least 24 hours before the end of the current period. Manage or cancel anytime in iOS Settings › your name › Subscriptions, or from Fenn's own Settings › Manage Subscription. If you've already purchased Fenn Plus, use Settings › Restore Purchases to reinstate it without paying again.",
     },
     {
       heading: 'Acceptable use',
