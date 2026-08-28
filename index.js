@@ -805,10 +805,33 @@ app.post('/revenuecat-webhook', revenueCatWebhookLimiter, async (req, res) => {
     case 'EXPIRATION':
       newTier = 'free';
       break;
+    // A previously-issued refund was itself reversed (e.g. a chargeback dispute resolved
+    // in the merchant's favor) - the original charge stands, so access is restored. Safe
+    // even if tier was never actually revoked for it in the first place (see CANCELLATION
+    // below) - this just confirms paid, the same no-op-if-already-correct behavior every
+    // other case in this switch already relies on.
+    case 'REFUND_REVERSED':
+      newTier = 'paid';
+      break;
     case 'CANCELLATION':
       // Auto-renew turned off, but per RevenueCat's own docs the current paid period is
       // still active - access continues until a later EXPIRATION actually arrives. Logged
       // above for audit visibility; deliberately not a tier change here.
+      //
+      // Note: there is no separate REFUND event type - RevenueCat fires a refund as THIS
+      // event with cancel_reason: 'CUSTOMER_SUPPORT' (full payload, cancel_reason included,
+      // is preserved in revenuecat_webhook_log for that case). Deliberately NOT auto-
+      // revoking tier on that reason specifically - RevenueCat's own docs warn a refund
+      // "doesn't mean...autorenewal preference has been deactivated, since refunds can be
+      // given without canceling a subscription" and recommend checking live subscription
+      // status via their API instead of assuming from the webhook alone. Guessing wrong
+      // here risks cutting off a still-legitimately-paying subscriber, which is worse than
+      // the alternative (a refunded-but-still-"paid"-until-EXPIRATION edge case) - same
+      // conservative reasoning as every other no-op case in this switch. Confirmed via a
+      // correctness audit: this is a real, currently latent gap (zero CUSTOMER_SUPPORT
+      // cancellations in production so far, both real ones logged are plain UNSUBSCRIBE) -
+      // worth a deliberate product decision on how aggressively to revoke in that specific
+      // case, not something to silently resolve either way here.
       break;
     case 'BILLING_ISSUE':
       // A renewal charge failed - Apple/RevenueCat retries during a grace period, during
