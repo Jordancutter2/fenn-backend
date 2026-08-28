@@ -373,7 +373,7 @@ async function resetPassword({ email, code, newPassword }) {
 // every sign-in after that omits it, since Apple already told us once. The client passes
 // along whatever it has from that first time; the server is the source of truth once a
 // user row exists (matched by Apple's stable `sub` identifier, not email).
-async function loginWithApple({ identityToken, email: emailFromClient, marketingConsent, tosAccepted }) {
+async function loginWithApple({ identityToken, email: emailFromClient, marketingConsent, tosAccepted, confirmNewAccount }) {
   let payload;
   try {
     payload = await verifyAppleIdentityToken(identityToken);
@@ -434,6 +434,27 @@ async function loginWithApple({ identityToken, email: emailFromClient, marketing
   if (!tosAccepted) {
     const err = new Error('You must accept the Terms of Service and Privacy Policy.');
     err.status = 400;
+    throw err;
+  }
+
+  // Reaching here means neither apple_user_id nor email matched an existing account, so
+  // this is about to create a brand new one - but a @privaterelay.appleid.com address means
+  // Apple's "Hide My Email" was used, which is exactly the case the email match above can
+  // never catch: Apple deliberately gives no way to link a relay address back to a real
+  // one, even for the same person on the same Apple ID. Someone who registered with
+  // email/password first, then later tried Apple sign-in with email hidden, would otherwise
+  // silently end up with two separate Fenn accounts instead of one. Confirmed via a
+  // correctness audit as a real, structural gap - not fixable in general, but worth
+  // catching at the one moment it's detectable (a fresh relay email with no match) rather
+  // than silently proceeding. confirmNewAccount (set by the client after showing this
+  // message and asking "would you like to create a new account anyway?") skips this on the
+  // deliberate retry.
+  if (!confirmNewAccount && email.endsWith('@privaterelay.appleid.com')) {
+    const err = new Error(
+      "If you already have a Fenn account, sign in with that email and password instead - Apple hid your email this time, so there's no way to tell it's the same person. Otherwise, go ahead and create a new account."
+    );
+    err.status = 409;
+    err.code = 'APPLE_RELAY_NEW_ACCOUNT';
     throw err;
   }
 

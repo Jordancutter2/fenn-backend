@@ -252,7 +252,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
 
 app.post('/api/auth/apple', authLimiter, async (req, res) => {
   try {
-    const { identity_token, email, marketing_consent, tos_accepted } = req.body;
+    const { identity_token, email, marketing_consent, tos_accepted, confirm_new_account } = req.body;
     if (!identity_token) {
       return res.status(400).json({ error: 'identity_token is required.' });
     }
@@ -261,10 +261,14 @@ app.post('/api/auth/apple', authLimiter, async (req, res) => {
       email,
       marketingConsent: marketing_consent,
       tosAccepted: tos_accepted,
+      confirmNewAccount: confirm_new_account,
     });
     res.json({ token, user, mfa_required: mfaRequired });
   } catch (err) {
-    res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to sign in with Apple' });
+    // code (e.g. APPLE_RELAY_NEW_ACCOUNT below) lets the client branch on the precise
+    // reason rather than string-matching err.message - same pattern changePassword's own
+    // WRONG_CURRENT_PASSWORD already uses.
+    res.status(err.status || 500).json({ error: err.status ? err.message : 'Failed to sign in with Apple', code: err.code });
   }
 });
 
