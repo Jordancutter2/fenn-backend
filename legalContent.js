@@ -16,7 +16,7 @@ const PRIVACY_POLICY = {
     },
     {
       heading: 'How we share it',
-      body: "With Plaid, Inc., to connect to and retrieve data from your bank on your behalf. With Neon and Railway, our database and server hosting providers, who store data on our behalf under their own security commitments. We do not sell your data, and we do not share it with advertisers.",
+      body: "With Plaid, Inc., to connect to and retrieve data from your bank on your behalf. With RevenueCat, to process Fenn Plus subscription purchases. With Sentry, to diagnose app crashes. With Neon and Railway, our database and server hosting providers, who store data on our behalf under their own security commitments. We do not sell your data, and we do not share it with advertisers.",
     },
     {
       heading: 'Security',
