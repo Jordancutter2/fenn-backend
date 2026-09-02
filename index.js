@@ -1932,8 +1932,14 @@ app.post('/api/expenses', async (req, res) => {
     // Number(), not the raw body value - see the same fix on POST /api/budget above for
     // why (a non-numeric string slipped past the old `!amount || amount <= 0` check).
     const amount = Number(rawAmount);
-    if (!Number.isFinite(amount) || amount <= 0 || amount > MAX_MONEY_AMOUNT) {
-      return res.status(400).json({ error: `amount must be a positive number up to ${MAX_MONEY_AMOUNT}` });
+    // Negative is allowed now (manual income) - same sign convention Plaid transactions
+    // already use throughout this file (money in = negative), so a manually-logged
+    // paycheck reads identically to an automatically-synced one everywhere downstream
+    // (getTransactionType on the client, the two spend-total queries below, which now
+    // both explicitly require amount > 0 for the same reason COUNTS_TOWARD_SPEND already
+    // does for Plaid transactions). Zero is still rejected either way - not a real entry.
+    if (!Number.isFinite(amount) || amount === 0 || Math.abs(amount) > MAX_MONEY_AMOUNT) {
+      return res.status(400).json({ error: `amount must be a nonzero number, magnitude up to ${MAX_MONEY_AMOUNT}` });
     }
     // isValidDateKey, not just a truthiness check - a malformed value (wrong format, or a
     // syntactically-plausible-but-nonexistent date) fell straight through to Postgres,
@@ -2102,8 +2108,12 @@ app.get('/api/spend', async (req, res) => {
         [userId, start, end, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, PFC_DETAILED_P2P_OUT, p2pExcluded, P2P_NAME_PATTERN]
       ),
       pool.query(
+        // amount > 0 - manual entries can be income now (negative, same convention as
+        // Plaid), which must never reduce a spend total any more than Plaid's own negative-
+        // amount income transactions do (see COUNTS_TOWARD_SPEND's identical amount > 0
+        // requirement just above).
         `SELECT COALESCE(SUM(amount), 0) AS total FROM manual_expenses
-         WHERE user_id = $1 AND local_date BETWEEN $2 AND $3`,
+         WHERE user_id = $1 AND local_date BETWEEN $2 AND $3 AND amount > 0`,
         [userId, start, end]
       ),
     ]);
@@ -2140,8 +2150,9 @@ app.get('/api/spend/daily', async (req, res) => {
          GROUP BY t.date
        ) t ON t.date = gs::date
        LEFT JOIN (
+         -- amount > 0 - same reasoning as /api/spend's identical manual_expenses query above.
          SELECT local_date, SUM(amount) AS total FROM manual_expenses
-         WHERE user_id = $1 AND local_date BETWEEN $2 AND $3
+         WHERE user_id = $1 AND local_date BETWEEN $2 AND $3 AND amount > 0
          GROUP BY local_date
        ) m ON m.local_date = gs::date
        ORDER BY gs`,
