@@ -53,6 +53,21 @@ function isValidId(value) {
   return /^\d+$/.test(value);
 }
 
+// Every bulk-action route below (bulk exclude, bulk category, bulk delete) takes an array
+// of row ids from the same request body shape - validated once here rather than three
+// times. Capped, not unbounded - a real "clean up a messy month" selection is a few dozen
+// rows at most; anything past this is either a client bug or someone poking at the endpoint
+// directly, not a real bulk action a person selected by hand in the UI. Returns a
+// deduplicated array of positive integers, or null if the input isn't a non-empty array of
+// valid ids within the cap.
+const BULK_MAX_IDS = 500;
+function parseIdArray(value) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > BULK_MAX_IDS) return null;
+  const ids = [...new Set(value.map((v) => Number(v)))];
+  if (ids.some((n) => !Number.isInteger(n) || n <= 0)) return null;
+  return ids;
+}
+
 const app = express();
 // Required for express-rate-limit (and req.ip generally) to see the real client IP rather
 // than one of Railway's own internal proxy hops - without this every request looks like
@@ -2043,6 +2058,24 @@ app.post('/api/expenses', async (req, res) => {
   }
 });
 
+// Registered BEFORE the single /api/expenses/:id route below - Express matches routes in
+// registration order, and :id matches any path segment (including the literal string
+// "bulk"), so this has to come first or a DELETE to /api/expenses/bulk would be swallowed
+// by the :id route instead (with isValidId's regex rejecting "bulk" as a 400, never
+// reaching this handler at all).
+app.delete('/api/expenses/bulk', async (req, res) => {
+  try {
+    const ids = parseIdArray(req.body?.ids);
+    if (!ids) return res.status(400).json({ error: `ids must be a non-empty array of up to ${BULK_MAX_IDS} ids` });
+    const userId = req.userId;
+    await pool.query('DELETE FROM manual_expenses WHERE id = ANY($1) AND user_id = $2', [ids, userId]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete expenses' });
+  }
+});
+
 app.delete('/api/expenses/:id', async (req, res) => {
   try {
     if (!isValidId(req.params.id)) {
@@ -2262,6 +2295,29 @@ app.patch('/api/transactions/:id/exclude_income', async (req, res) => {
   }
 });
 
+// Bulk version of the single exclude route above - a batched UPDATE...WHERE id = ANY(...)
+// instead of the frontend firing one request per selected row, for TransactionList's
+// multi-select mode. Same tri-state semantics as the single route (true/false is always an
+// explicit override, never a "clear it" - there's no bulk equivalent of null/no-override,
+// since a bulk action is inherently the user asserting a specific choice for every row they
+// picked).
+app.patch('/api/transactions/bulk_exclude', async (req, res) => {
+  try {
+    const ids = parseIdArray(req.body?.ids);
+    if (!ids) return res.status(400).json({ error: `ids must be a non-empty array of up to ${BULK_MAX_IDS} ids` });
+    const userId = req.userId;
+    await pool.query('UPDATE transactions SET user_excluded = $1 WHERE id = ANY($2) AND user_id = $3', [
+      !!req.body?.excluded,
+      ids,
+      userId,
+    ]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update transactions' });
+  }
+});
+
 // Overrides a synced transaction's display name - stored separately from Plaid's own
 // name/merchant_name (see user_label's schema comment) so it survives the next
 // /api/sync_transactions upsert instead of being silently overwritten by Plaid's value on
@@ -2337,6 +2393,47 @@ app.patch('/api/transactions/:id/category', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to recategorize transaction' });
+  }
+});
+
+// Bulk recategorize, across both transactions and manual_expenses at once (a multi-select
+// selection can freely mix synced and manual rows) - for TransactionList's multi-select
+// mode. transactionIds/expenseIds are each optional (defaulting to none), but at least one
+// non-empty array is required. No applyToMerchant here, unlike the single route above - a
+// bulk selection can span several different merchants at once (or none, for manual rows),
+// so "always categorize this merchant" doesn't generalize the way it does for a single
+// transaction's own recategorize.
+app.patch('/api/bulk_category', async (req, res) => {
+  try {
+    const transactionIds = req.body?.transactionIds != null ? parseIdArray(req.body.transactionIds) : [];
+    const expenseIds = req.body?.expenseIds != null ? parseIdArray(req.body.expenseIds) : [];
+    if (transactionIds === null || expenseIds === null) {
+      return res.status(400).json({ error: `ids must be arrays of up to ${BULK_MAX_IDS} ids` });
+    }
+    if (transactionIds.length === 0 && expenseIds.length === 0) {
+      return res.status(400).json({ error: 'At least one of transactionIds/expenseIds is required' });
+    }
+    const choice = parseCategoryChoice(req.body);
+    if (!choice) return res.status(400).json({ error: 'Invalid category choice' });
+    const userId = req.userId;
+    await Promise.all([
+      transactionIds.length > 0
+        ? pool.query(
+            'UPDATE transactions SET user_pfc_primary = $1, user_category_label = $2, user_category_color = $3 WHERE id = ANY($4) AND user_id = $5',
+            [choice.pfcPrimary, choice.customLabel, choice.customColor, transactionIds, userId]
+          )
+        : null,
+      expenseIds.length > 0
+        ? pool.query(
+            'UPDATE manual_expenses SET pfc_primary = $1, category_label = $2, category_color = $3 WHERE id = ANY($4) AND user_id = $5',
+            [choice.pfcPrimary, choice.customLabel, choice.customColor, expenseIds, userId]
+          )
+        : null,
+    ]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to recategorize' });
   }
 });
 
