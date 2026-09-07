@@ -1110,8 +1110,8 @@ async function syncOneItem(item, userId) {
   if (toUpsert.length > 0) {
     await pool.query(
       `INSERT INTO transactions
-         (plaid_item_id, user_id, plaid_transaction_id, account_id, amount, iso_currency_code, date, name, merchant_name, pending, pfc_primary, pfc_detailed, updated_at)
-       SELECT $1::integer, $2::integer, u.*, now()
+         (plaid_item_id, user_id, plaid_transaction_id, account_id, amount, iso_currency_code, date, name, merchant_name, pending, pfc_primary, pfc_detailed, merchant_key, updated_at)
+       SELECT $1::integer, $2::integer, u.*, NULLIF(LOWER(TRIM(COALESCE(u.merchant_name, u.name))), ''), now()
        FROM unnest($3::text[], $4::text[], $5::numeric[], $6::text[], $7::date[], $8::text[], $9::text[], $10::boolean[], $11::text[], $12::text[])
          AS u(plaid_transaction_id, account_id, amount, iso_currency_code, date, name, merchant_name, pending, pfc_primary, pfc_detailed)
        ON CONFLICT (plaid_transaction_id) DO UPDATE SET
@@ -1122,6 +1122,7 @@ async function syncOneItem(item, userId) {
          pending = EXCLUDED.pending,
          pfc_primary = EXCLUDED.pfc_primary,
          pfc_detailed = EXCLUDED.pfc_detailed,
+         merchant_key = EXCLUDED.merchant_key,
          updated_at = now()`,
       [
         item.id,
@@ -1361,6 +1362,7 @@ app.get('/api/transactions', async (req, res) => {
         // without the frontend needing to know that setting exists at all.
         `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, COALESCE(t.user_amount, t.amount) AS amount, t.pending, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, pi.institution_name,
            t.user_label, t.user_pfc_primary, t.user_category_label, t.user_category_color,
+           cr.pfc_primary AS rule_pfc_primary, cr.category_label AS rule_category_label, cr.category_color AS rule_category_color,
            CASE
              WHEN COALESCE(t.user_amount, t.amount) <= 0 THEN true
              WHEN t.user_excluded IS NOT NULL THEN t.user_excluded
@@ -1377,6 +1379,7 @@ app.get('/api/transactions', async (req, res) => {
            END AS user_income_excluded
          FROM transactions t
          JOIN plaid_items pi ON pi.id = t.plaid_item_id
+         LEFT JOIN category_rules cr ON cr.user_id = t.user_id AND cr.merchant_key = t.merchant_key
          WHERE t.user_id = $1 AND t.date BETWEEN $2 AND $5
          ORDER BY t.date DESC, t.id
          LIMIT 5000`,
@@ -1394,9 +1397,12 @@ app.get('/api/transactions', async (req, res) => {
       // DATE column serializes as a full ISO timestamp, not the plain 'YYYY-MM-DD' every
       // date-string helper in the app expects). This fallback branch (no date/start/end
       // query params) had been missed when that fix was made for the ranged branch.
-      `SELECT id, to_char(date, 'YYYY-MM-DD') AS date, name, merchant_name, COALESCE(user_amount, amount) AS amount, pending, pfc_primary, pfc_detailed, user_excluded,
-              user_label, user_pfc_primary, user_category_label, user_category_color
-       FROM transactions WHERE user_id = $1 ORDER BY date DESC LIMIT 100`,
+      `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, COALESCE(t.user_amount, t.amount) AS amount, t.pending, t.pfc_primary, t.pfc_detailed, t.user_excluded,
+              t.user_label, t.user_pfc_primary, t.user_category_label, t.user_category_color,
+              cr.pfc_primary AS rule_pfc_primary, cr.category_label AS rule_category_label, cr.category_color AS rule_category_color
+       FROM transactions t
+       LEFT JOIN category_rules cr ON cr.user_id = t.user_id AND cr.merchant_key = t.merchant_key
+       WHERE t.user_id = $1 ORDER BY t.date DESC LIMIT 100`,
       [userId]
     );
     res.json(result.rows);
@@ -1428,6 +1434,7 @@ app.get('/api/search', async (req, res) => {
       pool.query(
         `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, COALESCE(t.user_amount, t.amount) AS amount, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, pi.institution_name,
            t.user_label, t.user_pfc_primary, t.user_category_label, t.user_category_color,
+           cr.pfc_primary AS rule_pfc_primary, cr.category_label AS rule_category_label, cr.category_color AS rule_category_color,
            CASE
              WHEN COALESCE(t.user_amount, t.amount) <= 0 THEN true
              WHEN t.user_excluded IS NOT NULL THEN t.user_excluded
@@ -1444,6 +1451,7 @@ app.get('/api/search', async (req, res) => {
            END AS user_income_excluded
          FROM transactions t
          JOIN plaid_items pi ON pi.id = t.plaid_item_id
+         LEFT JOIN category_rules cr ON cr.user_id = t.user_id AND cr.merchant_key = t.merchant_key
          WHERE t.user_id = $1 AND (t.merchant_name ILIKE $2 OR t.name ILIKE $2)
          ORDER BY t.date DESC, t.id
          LIMIT 50`,
@@ -2175,6 +2183,38 @@ app.post('/api/categories', async (req, res) => {
   }
 });
 
+// The user's own standing "always categorize X as Y" merchant rules (see category_rules'
+// own schema comment) - a settings-level management list, so a rule created in passing from
+// a recategorize sheet doesn't become permanently invisible/un-removable.
+app.get('/api/category_rules', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, merchant_label, pfc_primary, category_label, category_color FROM category_rules WHERE user_id = $1 ORDER BY merchant_label',
+      [req.userId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch category rules' });
+  }
+});
+
+// Removing a rule takes effect everywhere immediately (read-time JOIN, nothing stamped onto
+// individual transactions) - every transaction from that merchant reverts to its own
+// per-transaction override if it has one, else Plaid's own category, the moment this runs.
+app.delete('/api/category_rules/:id', async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid rule id' });
+    }
+    await pool.query('DELETE FROM category_rules WHERE id = $1 AND user_id = $2', [req.params.id, req.userId]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete category rule' });
+  }
+});
+
 // Toggle whether a single synced transaction counts toward the budget
 // (e.g. excluding a one-off flight). Plaid transactions are never deleted, only excluded.
 app.patch('/api/transactions/:id/exclude', async (req, res) => {
@@ -2251,14 +2291,19 @@ app.patch('/api/transactions/:id/label', async (req, res) => {
 // Overrides a synced transaction's category - same reasoning as the label override above
 // (Plaid's own pfc_primary gets overwritten by every sync, so a user's choice needs its own
 // column to survive it). Passing pfcPrimary: null clears the override, reverting to
-// whatever Plaid's own categorizer assigned.
+// whatever Plaid's own categorizer assigned (and this transaction's own resolved category
+// falls through to any still-active merchant rule, then Plaid's own value - see
+// /api/transactions' own COALESCE order). applyToMerchant: true additionally upserts a
+// category_rules row for this transaction's merchant (see its own schema comment) - silently
+// skipped, not an error, when the transaction has no merchant_key (nothing to key a rule on)
+// or the caller is clearing the category (there's no category left to turn into a rule).
 app.patch('/api/transactions/:id/category', async (req, res) => {
   try {
     if (!isValidId(req.params.id)) {
       return res.status(400).json({ error: 'Invalid transaction id' });
     }
+    const userId = req.userId;
     if (req.body?.pfcPrimary === null) {
-      const userId = req.userId;
       const result = await pool.query(
         'UPDATE transactions SET user_pfc_primary = NULL, user_category_label = NULL, user_category_color = NULL WHERE id = $1 AND user_id = $2 RETURNING id',
         [req.params.id, userId]
@@ -2268,12 +2313,26 @@ app.patch('/api/transactions/:id/category', async (req, res) => {
     }
     const choice = parseCategoryChoice(req.body);
     if (!choice) return res.status(400).json({ error: 'Invalid category choice' });
-    const userId = req.userId;
     const result = await pool.query(
-      'UPDATE transactions SET user_pfc_primary = $1, user_category_label = $2, user_category_color = $3 WHERE id = $4 AND user_id = $5 RETURNING id',
+      `UPDATE transactions SET user_pfc_primary = $1, user_category_label = $2, user_category_color = $3
+       WHERE id = $4 AND user_id = $5
+       RETURNING merchant_key, COALESCE(merchant_name, name) AS merchant_label`,
       [choice.pfcPrimary, choice.customLabel, choice.customColor, req.params.id, userId]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Transaction not found' });
+    const { merchant_key: merchantKey, merchant_label: merchantLabel } = result.rows[0];
+    if (req.body?.applyToMerchant && merchantKey) {
+      await pool.query(
+        `INSERT INTO category_rules (user_id, merchant_key, merchant_label, pfc_primary, category_label, category_color)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (user_id, merchant_key) DO UPDATE SET
+           merchant_label = EXCLUDED.merchant_label,
+           pfc_primary = EXCLUDED.pfc_primary,
+           category_label = EXCLUDED.category_label,
+           category_color = EXCLUDED.category_color`,
+        [userId, merchantKey, merchantLabel, choice.pfcPrimary, choice.customLabel, choice.customColor]
+      );
+    }
     res.json({ ok: true });
   } catch (err) {
     console.error(err);

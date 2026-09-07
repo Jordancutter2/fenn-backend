@@ -218,6 +218,40 @@ ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_category_color TEXT;
 -- not turning a purchase into income or vice versa.
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_amount NUMERIC(12, 2);
 
+-- Normalized merchant identity (lower/trim of merchant_name, falling back to name),
+-- computed once at sync time rather than as a per-query expression - lets category_rules
+-- below join against it with a plain indexed equality instead of recomputing
+-- LOWER(TRIM(...)) in every query that needs it. NULL on the rare row with neither
+-- merchant_name nor name (a rule can never match it, which is correct - there's no stable
+-- identity to hang a rule off of).
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS merchant_key TEXT;
+UPDATE transactions SET merchant_key = NULLIF(LOWER(TRIM(COALESCE(merchant_name, name))), '') WHERE merchant_key IS NULL;
+CREATE INDEX IF NOT EXISTS idx_transactions_user_merchant_key ON transactions(user_id, merchant_key);
+
+-- A user's standing "always categorize transactions from this merchant as X" rule -
+-- recategorizing one transaction with applyToMerchant:true (PATCH .../category) both sets
+-- that transaction's own user_pfc_primary AND upserts one of these, so every OTHER past and
+-- future transaction from the same merchant picks up the category too, not just the one
+-- that happened to get tapped. Read-time only (joined in on merchant_key, see
+-- /api/transactions and /api/search), not written back onto matching rows - the same
+-- reasoning user_excluded/user_income_excluded are already resolved at read time rather
+-- than stamped onto every row: editing or deleting a rule takes effect everywhere
+-- immediately, with nothing to backfill or un-backfill. A transaction's own explicit
+-- user_pfc_primary override still wins over a rule that would otherwise apply to it (see
+-- the COALESCE order in /api/transactions) - a one-off correction on a single occurrence
+-- doesn't get silently overruled by the merchant's general rule.
+CREATE TABLE IF NOT EXISTS category_rules (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  merchant_key TEXT NOT NULL,
+  merchant_label TEXT NOT NULL,
+  pfc_primary TEXT NOT NULL,
+  category_label TEXT,
+  category_color TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(user_id, merchant_key)
+);
+
 -- Recurring bills, detected via Plaid's /transactions/recurring/get (outflow streams only -
 -- recurring income isn't a "bill"). Excluded from daily spend per the spec, shown in their
 -- own view instead. Refreshed by calling /api/sync_recurring, not on every regular sync -
