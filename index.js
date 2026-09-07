@@ -1271,6 +1271,47 @@ async function getP2PTransfersExcluded(userId) {
   return result.rows[0]?.p2p_transfers_excluded ?? false;
 }
 
+// The built-in category codes a transaction/manual expense can be recategorized into -
+// must stay in sync by hand with the CATEGORIES map in app/Icons.js (that file is the
+// display-side source of truth: label + icon per code). 'CUSTOM' is the one reserved value
+// outside this list, meaning "use this row's own category_label/category_color instead."
+const CATEGORY_KEYS = [
+  'FOOD_AND_DRINK',
+  'GENERAL_MERCHANDISE',
+  'TRANSPORTATION',
+  'ENTERTAINMENT',
+  'TRAVEL',
+  'RENT_AND_UTILITIES',
+  'GENERAL_SERVICES',
+  'MEDICAL',
+  'PERSONAL_CARE',
+  'GOVERNMENT_AND_NON_PROFIT',
+  'LOAN_PAYMENTS',
+  'HOME_IMPROVEMENT',
+  'BANK_FEES',
+];
+const TRANSACTION_LABEL_MAX = 80;
+const CUSTOM_CATEGORY_LABEL_MAX = 30;
+const HEX_COLOR_PATTERN = /^#[0-9a-fA-F]{6}$/;
+
+// Shared by the four recategorize endpoints below (transactions + manual expenses each get
+// their own PATCH .../category route, but the request shape and validation are identical).
+// Returns { pfcPrimary, customLabel, customColor } on success (customLabel/customColor are
+// null unless pfcPrimary is 'CUSTOM'), or null if the body doesn't describe a valid choice.
+function parseCategoryChoice(body) {
+  const pfcPrimary = body?.pfcPrimary;
+  if (pfcPrimary === 'CUSTOM') {
+    const customLabel = typeof body?.customLabel === 'string' ? body.customLabel.trim() : '';
+    const customColor = typeof body?.customColor === 'string' ? body.customColor.trim() : '';
+    if (!customLabel || customLabel.length > CUSTOM_CATEGORY_LABEL_MAX || !HEX_COLOR_PATTERN.test(customColor)) {
+      return null;
+    }
+    return { pfcPrimary, customLabel, customColor };
+  }
+  if (!CATEGORY_KEYS.includes(pfcPrimary)) return null;
+  return { pfcPrimary, customLabel: null, customColor: null };
+}
+
 // Read-only view of what's actually in our database now, for testing/verification.
 app.get('/api/transactions', async (req, res) => {
   try {
@@ -1319,6 +1360,7 @@ app.get('/api/transactions', async (req, res) => {
         // to users.p2p_transfers_excluded ($7) the moment there's no individual override,
         // without the frontend needing to know that setting exists at all.
         `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pending, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, pi.institution_name,
+           t.user_label, t.user_pfc_primary, t.user_category_label, t.user_category_color,
            CASE
              WHEN t.amount <= 0 THEN true
              WHEN t.user_excluded IS NOT NULL THEN t.user_excluded
@@ -1352,7 +1394,8 @@ app.get('/api/transactions', async (req, res) => {
       // DATE column serializes as a full ISO timestamp, not the plain 'YYYY-MM-DD' every
       // date-string helper in the app expects). This fallback branch (no date/start/end
       // query params) had been missed when that fix was made for the ranged branch.
-      `SELECT id, to_char(date, 'YYYY-MM-DD') AS date, name, merchant_name, amount, pending, pfc_primary, pfc_detailed, user_excluded
+      `SELECT id, to_char(date, 'YYYY-MM-DD') AS date, name, merchant_name, amount, pending, pfc_primary, pfc_detailed, user_excluded,
+              user_label, user_pfc_primary, user_category_label, user_category_color
        FROM transactions WHERE user_id = $1 ORDER BY date DESC LIMIT 100`,
       [userId]
     );
@@ -1384,6 +1427,7 @@ app.get('/api/search', async (req, res) => {
     const [txns, manual] = await Promise.all([
       pool.query(
         `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, pi.institution_name,
+           t.user_label, t.user_pfc_primary, t.user_category_label, t.user_category_color,
            CASE
              WHEN t.amount <= 0 THEN true
              WHEN t.user_excluded IS NOT NULL THEN t.user_excluded
@@ -1406,7 +1450,8 @@ app.get('/api/search', async (req, res) => {
         [userId, like, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, PFC_DETAILED_P2P_OUT, p2pExcluded, PFC_DETAILED_P2P_IN, P2P_NAME_PATTERN]
       ),
       pool.query(
-        `SELECT id, amount, note, to_char(local_date, 'YYYY-MM-DD') AS local_date, occurred_at
+        `SELECT id, amount, note, to_char(local_date, 'YYYY-MM-DD') AS local_date, occurred_at,
+                pfc_primary, category_label, category_color
          FROM manual_expenses
          WHERE user_id = $1 AND note ILIKE $2
          ORDER BY occurred_at DESC
@@ -1916,7 +1961,7 @@ app.get('/api/expenses', async (req, res) => {
     const rangeEnd = date || end;
     const result = await pool.query(
       // to_char, not a bare column - see the equivalent note on /api/transactions above.
-      "SELECT id, amount, note, to_char(local_date, 'YYYY-MM-DD') AS local_date, occurred_at FROM manual_expenses WHERE user_id = $1 AND local_date BETWEEN $2 AND $3 ORDER BY occurred_at DESC",
+      "SELECT id, amount, note, to_char(local_date, 'YYYY-MM-DD') AS local_date, occurred_at, pfc_primary, category_label, category_color FROM manual_expenses WHERE user_id = $1 AND local_date BETWEEN $2 AND $3 ORDER BY occurred_at DESC",
       [userId, rangeStart, rangeEnd]
     );
     res.json(result.rows);
@@ -1969,7 +2014,7 @@ app.post('/api/expenses', async (req, res) => {
       // instead of 'YYYY-MM-DD') until the next GET refetch corrected it.
       `INSERT INTO manual_expenses (user_id, amount, note, local_date, occurred_at)
        VALUES ($1, $2, $3, $4, COALESCE($5, now()))
-       RETURNING id, amount, note, to_char(local_date, 'YYYY-MM-DD') AS local_date, occurred_at`,
+       RETURNING id, amount, note, to_char(local_date, 'YYYY-MM-DD') AS local_date, occurred_at, pfc_primary, category_label, category_color`,
       [userId, amount, note || null, local_date, occurred_at || null]
     );
     res.json(result.rows[0]);
@@ -1990,6 +2035,97 @@ app.delete('/api/expenses/:id', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to delete expense' });
+  }
+});
+
+// Renames a manually-logged expense's own note - the only "name" it has (there's no Plaid
+// value underneath to override, unlike a synced transaction's user_label below). An empty/
+// missing label clears it back to unnamed ("Manual expense" on the client), same as note
+// already worked on creation.
+app.patch('/api/expenses/:id/label', async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid expense id' });
+    }
+    const label = typeof req.body?.label === 'string' ? req.body.label.trim() : '';
+    if (label.length > TRANSACTION_LABEL_MAX) {
+      return res.status(400).json({ error: `label must be ${TRANSACTION_LABEL_MAX} characters or fewer` });
+    }
+    const userId = req.userId;
+    const result = await pool.query(
+      'UPDATE manual_expenses SET note = $1 WHERE id = $2 AND user_id = $3 RETURNING id',
+      [label || null, req.params.id, userId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Expense not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to rename expense' });
+  }
+});
+
+// Assigns (or reassigns) a manual expense's category - it has none by default, unlike a
+// synced transaction which starts with whatever Plaid's own categorizer assigned.
+app.patch('/api/expenses/:id/category', async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid expense id' });
+    }
+    const choice = parseCategoryChoice(req.body);
+    if (!choice) return res.status(400).json({ error: 'Invalid category choice' });
+    const userId = req.userId;
+    const result = await pool.query(
+      'UPDATE manual_expenses SET pfc_primary = $1, category_label = $2, category_color = $3 WHERE id = $4 AND user_id = $5 RETURNING id',
+      [choice.pfcPrimary, choice.customLabel, choice.customColor, req.params.id, userId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Expense not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to recategorize expense' });
+  }
+});
+
+// The user's own saved custom categories ("Pets", "Subscriptions", ...) - the menu the
+// category picker offers alongside the built-in CATEGORY_KEYS list, and what "add a new
+// category" writes to.
+app.get('/api/categories', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, label, color FROM custom_categories WHERE user_id = $1 ORDER BY created_at',
+      [req.userId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to fetch categories' });
+  }
+});
+
+// Upsert on (user_id, label) - re-creating a category with a name that already exists just
+// updates its color and returns the existing row, rather than erroring or quietly forking
+// into a near-duplicate ("Pets" typed twice with two different colors).
+app.post('/api/categories', async (req, res) => {
+  try {
+    const label = typeof req.body?.label === 'string' ? req.body.label.trim() : '';
+    const color = typeof req.body?.color === 'string' ? req.body.color.trim() : '';
+    if (!label || label.length > CUSTOM_CATEGORY_LABEL_MAX) {
+      return res.status(400).json({ error: `label is required, ${CUSTOM_CATEGORY_LABEL_MAX} characters or fewer` });
+    }
+    if (!HEX_COLOR_PATTERN.test(color)) {
+      return res.status(400).json({ error: 'color must be a 6-digit hex value, e.g. #4C5FF0' });
+    }
+    const result = await pool.query(
+      `INSERT INTO custom_categories (user_id, label, color)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (user_id, label) DO UPDATE SET color = EXCLUDED.color
+       RETURNING id, label, color`,
+      [req.userId, label, color]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to save category' });
   }
 });
 
@@ -2037,6 +2173,65 @@ app.patch('/api/transactions/:id/exclude_income', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to update transaction' });
+  }
+});
+
+// Overrides a synced transaction's display name - stored separately from Plaid's own
+// name/merchant_name (see user_label's schema comment) so it survives the next
+// /api/sync_transactions upsert instead of being silently overwritten by Plaid's value on
+// the next sync. An empty/missing label clears the override, reverting to Plaid's own name.
+app.patch('/api/transactions/:id/label', async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid transaction id' });
+    }
+    const label = typeof req.body?.label === 'string' ? req.body.label.trim() : '';
+    if (label.length > TRANSACTION_LABEL_MAX) {
+      return res.status(400).json({ error: `label must be ${TRANSACTION_LABEL_MAX} characters or fewer` });
+    }
+    const userId = req.userId;
+    const result = await pool.query(
+      'UPDATE transactions SET user_label = $1 WHERE id = $2 AND user_id = $3 RETURNING id',
+      [label || null, req.params.id, userId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Transaction not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to rename transaction' });
+  }
+});
+
+// Overrides a synced transaction's category - same reasoning as the label override above
+// (Plaid's own pfc_primary gets overwritten by every sync, so a user's choice needs its own
+// column to survive it). Passing pfcPrimary: null clears the override, reverting to
+// whatever Plaid's own categorizer assigned.
+app.patch('/api/transactions/:id/category', async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid transaction id' });
+    }
+    if (req.body?.pfcPrimary === null) {
+      const userId = req.userId;
+      const result = await pool.query(
+        'UPDATE transactions SET user_pfc_primary = NULL, user_category_label = NULL, user_category_color = NULL WHERE id = $1 AND user_id = $2 RETURNING id',
+        [req.params.id, userId]
+      );
+      if (result.rows.length === 0) return res.status(404).json({ error: 'Transaction not found' });
+      return res.json({ ok: true });
+    }
+    const choice = parseCategoryChoice(req.body);
+    if (!choice) return res.status(400).json({ error: 'Invalid category choice' });
+    const userId = req.userId;
+    const result = await pool.query(
+      'UPDATE transactions SET user_pfc_primary = $1, user_category_label = $2, user_category_color = $3 WHERE id = $4 AND user_id = $5 RETURNING id',
+      [choice.pfcPrimary, choice.customLabel, choice.customColor, req.params.id, userId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Transaction not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to recategorize transaction' });
   }
 });
 

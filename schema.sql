@@ -194,6 +194,19 @@ UPDATE transactions SET user_excluded = NULL WHERE user_excluded = false;
 
 CREATE INDEX IF NOT EXISTS idx_transactions_user_date ON transactions(user_id, date);
 
+-- A user's own rename/recategorize of a transaction. Plaid's own name/merchant_name/
+-- pfc_primary get overwritten wholesale on every /api/sync_transactions upsert, so an
+-- override has to live in its own columns to survive the next sync - these are never
+-- touched by that upsert. NULL means "no override, use Plaid's own value." user_category_*
+-- are only populated when user_pfc_primary is 'CUSTOM' (see custom_categories below) - a
+-- snapshot copied at assignment time, not joined at read time, so a later rename of the
+-- custom category itself (not supported yet) can't retroactively change how already-
+-- categorized past transactions render.
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_label TEXT;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_pfc_primary TEXT;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_category_label TEXT;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_category_color TEXT;
+
 -- Recurring bills, detected via Plaid's /transactions/recurring/get (outflow streams only -
 -- recurring income isn't a "bill"). Excluded from daily spend per the spec, shown in their
 -- own view instead. Refreshed by calling /api/sync_recurring, not on every regular sync -
@@ -307,6 +320,30 @@ CREATE TABLE IF NOT EXISTS manual_expenses (
 ALTER TABLE manual_expenses ADD COLUMN IF NOT EXISTS local_date DATE;
 
 CREATE INDEX IF NOT EXISTS idx_manual_expenses_user_local_date ON manual_expenses(user_id, local_date);
+
+-- Manual expenses never had a category at all - a plain logged amount+note with no way to
+-- group it the way a bank-synced transaction's Plaid category already allows. pfc_primary
+-- here is a real assignment, not an override (there's no Plaid value underneath it), so
+-- unlike transactions.user_pfc_primary this is the only category column manual expenses
+-- have. category_label/category_color are the same custom-category snapshot as
+-- transactions.user_category_label/color above, populated only when pfc_primary = 'CUSTOM'.
+ALTER TABLE manual_expenses ADD COLUMN IF NOT EXISTS pfc_primary TEXT;
+ALTER TABLE manual_expenses ADD COLUMN IF NOT EXISTS category_label TEXT;
+ALTER TABLE manual_expenses ADD COLUMN IF NOT EXISTS category_color TEXT;
+
+-- A user's own custom categories ("Pets", "Subscriptions", ...) for when none of the
+-- built-in Plaid-derived categories fit. Kept as a real, reusable list (rather than a
+-- free-text value typed fresh each time) so the category picker can offer previously
+-- created ones back, and so re-entering the same name updates one row instead of quietly
+-- forking into near-duplicates ("Pets" / "pets" / "Pet stuff").
+CREATE TABLE IF NOT EXISTS custom_categories (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  label TEXT NOT NULL,
+  color TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(user_id, label)
+);
 
 -- Every webhook Plaid ever sends us, regardless of type - an audit trail more than an
 -- operational table today, since nothing acts on specific webhook codes yet beyond logging
