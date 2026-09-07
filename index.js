@@ -2006,16 +2006,27 @@ app.post('/api/expenses', async (req, res) => {
     if (occurred_at != null && Number.isNaN(new Date(occurred_at).getTime())) {
       return res.status(400).json({ error: 'occurred_at must be a valid timestamp' });
     }
+    // Optional - most manual expenses (and every manual income entry) still create with no
+    // category at all, same as before this existed. Only validated/applied when the body
+    // actually names one, using the same parseCategoryChoice the PATCH .../category route
+    // uses, so a category picked in AddExpenseModal before the first save lands atomically
+    // with the row instead of needing a second round-trip right after creation.
+    let categoryChoice = { pfcPrimary: null, customLabel: null, customColor: null };
+    if (req.body.pfcPrimary != null) {
+      const parsed = parseCategoryChoice(req.body);
+      if (!parsed) return res.status(400).json({ error: 'Invalid category choice' });
+      categoryChoice = parsed;
+    }
     const userId = req.userId;
     const result = await pool.query(
       // to_char on the RETURNING clause too, not just GET /api/expenses's own SELECT -
       // local_date is the same raw DATE column either way, so without this the response
       // right after logging an expense carried a malformed date (a full ISO timestamp
       // instead of 'YYYY-MM-DD') until the next GET refetch corrected it.
-      `INSERT INTO manual_expenses (user_id, amount, note, local_date, occurred_at)
-       VALUES ($1, $2, $3, $4, COALESCE($5, now()))
+      `INSERT INTO manual_expenses (user_id, amount, note, local_date, occurred_at, pfc_primary, category_label, category_color)
+       VALUES ($1, $2, $3, $4, COALESCE($5, now()), $6, $7, $8)
        RETURNING id, amount, note, to_char(local_date, 'YYYY-MM-DD') AS local_date, occurred_at, pfc_primary, category_label, category_color`,
-      [userId, amount, note || null, local_date, occurred_at || null]
+      [userId, amount, note || null, local_date, occurred_at || null, categoryChoice.pfcPrimary, categoryChoice.customLabel, categoryChoice.customColor]
     );
     res.json(result.rows[0]);
   } catch (err) {
