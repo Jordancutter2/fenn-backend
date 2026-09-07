@@ -49,8 +49,17 @@ function isValidDateKey(value) {
 // at the endpoint) previously fell straight through to a parameterized query, which
 // Postgres rejects as a type-cast error on an INTEGER column, caught generically as a bare
 // 500 instead of a clean 400/404.
+// Every id column in schema.sql is a plain SERIAL (4-byte Postgres integer), so anything
+// past this can never be a real row id - without this bound, isValidId/parseIdArray below
+// only checked "all digits"/"positive integer," and a sufficiently long digit string (or
+// array element) passed the regex/Number.isInteger check, then overflowed the column at the
+// parameterized-query layer, producing a raw type/range error caught by the generic handler
+// as a bare 500 instead of the clean 400 these checks exist to guarantee. Found by a
+// correctness audit.
+const PG_INT_MAX = 2147483647;
+
 function isValidId(value) {
-  return /^\d+$/.test(value);
+  return /^\d+$/.test(value) && Number(value) <= PG_INT_MAX;
 }
 
 // Every bulk-action route below (bulk exclude, bulk category, bulk delete) takes an array
@@ -64,7 +73,7 @@ const BULK_MAX_IDS = 500;
 function parseIdArray(value) {
   if (!Array.isArray(value) || value.length === 0 || value.length > BULK_MAX_IDS) return null;
   const ids = [...new Set(value.map((v) => Number(v)))];
-  if (ids.some((n) => !Number.isInteger(n) || n <= 0)) return null;
+  if (ids.some((n) => !Number.isInteger(n) || n <= 0 || n > PG_INT_MAX)) return null;
   return ids;
 }
 
@@ -1407,18 +1416,43 @@ app.get('/api/transactions', async (req, res) => {
       return res.json(result.rows);
     }
 
+    // Same excluded/user_income_excluded resolution as the ranged branch above - this
+    // fallback (no date/start/end query params) previously returned the raw, nullable
+    // user_excluded column as-is and omitted user_income_excluded entirely, silently
+    // disagreeing with what /api/spend would compute for the same transaction (a transfer,
+    // recurring bill, or P2P payment that should default-exclude would come back
+    // excluded: null here). Confirmed unreachable through the app's own UI today (both real
+    // callers, api.js's getTransactionsForDate/getTransactionsForRange, always send date or
+    // start+end), but this is a live, authenticated route - a malformed or direct request
+    // (even just `?start=` alone, which also falls through to this branch) shouldn't get a
+    // different answer than a well-formed one. Found by a correctness audit.
+    const p2pExcluded = await getP2PTransfersExcluded(userId);
     const result = await pool.query(
       // to_char, not a bare column - same reasoning as the ranged branch above (a raw
       // DATE column serializes as a full ISO timestamp, not the plain 'YYYY-MM-DD' every
-      // date-string helper in the app expects). This fallback branch (no date/start/end
-      // query params) had been missed when that fix was made for the ranged branch.
-      `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, COALESCE(t.user_amount, t.amount) AS amount, t.pending, t.pfc_primary, t.pfc_detailed, t.user_excluded,
-              t.user_label, t.user_pfc_primary, t.user_category_label, t.user_category_color,
-              cr.pfc_primary AS rule_pfc_primary, cr.category_label AS rule_category_label, cr.category_color AS rule_category_color
+      // date-string helper in the app expects).
+      `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, COALESCE(t.user_amount, t.amount) AS amount, t.pending, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, pi.institution_name,
+         t.user_label, t.user_pfc_primary, t.user_category_label, t.user_category_color,
+         cr.pfc_primary AS rule_pfc_primary, cr.category_label AS rule_category_label, cr.category_color AS rule_category_color,
+         CASE
+           WHEN COALESCE(t.user_amount, t.amount) <= 0 THEN true
+           WHEN t.user_excluded IS NOT NULL THEN t.user_excluded
+           WHEN t.is_recurring_bill THEN true
+           WHEN (t.pfc_detailed = $4 OR t.name ~* $7) THEN $5
+           ELSE (
+             COALESCE(t.pfc_primary, '') = ANY($2) OR COALESCE(t.pfc_detailed, '') = ANY($3)
+           )
+         END AS excluded,
+         CASE
+           WHEN t.user_income_excluded IS NOT NULL THEN t.user_income_excluded
+           WHEN (t.pfc_detailed = $6 OR (COALESCE(t.user_amount, t.amount) < 0 AND t.name ~* $7)) THEN $5
+           ELSE false
+         END AS user_income_excluded
        FROM transactions t
+       JOIN plaid_items pi ON pi.id = t.plaid_item_id
        LEFT JOIN category_rules cr ON cr.user_id = t.user_id AND cr.merchant_key = t.merchant_key
        WHERE t.user_id = $1 ORDER BY t.date DESC LIMIT 100`,
-      [userId]
+      [userId, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, PFC_DETAILED_P2P_OUT, p2pExcluded, PFC_DETAILED_P2P_IN, P2P_NAME_PATTERN]
     );
     res.json(result.rows);
   } catch (err) {
@@ -2159,9 +2193,16 @@ app.patch('/api/expenses/:id/label', async (req, res) => {
     if (!isValidId(req.params.id)) {
       return res.status(400).json({ error: 'Invalid expense id' });
     }
+    // NOTE_MAX_LENGTH, not TRANSACTION_LABEL_MAX - this writes to the same `note` column
+    // POST /api/expenses does, which already allows up to NOTE_MAX_LENGTH. Capping a rename
+    // tighter than creation allowed meant a note saved with 81-500 characters could never be
+    // "renamed" again, even to re-save the identical text, without first shortening it below
+    // 80 - found by a correctness audit. TRANSACTION_LABEL_MAX still applies to a synced
+    // transaction's own label PATCH below, which writes to a different column
+    // (user_label) with no such pre-existing wider value to conflict with.
     const label = typeof req.body?.label === 'string' ? req.body.label.trim() : '';
-    if (label.length > TRANSACTION_LABEL_MAX) {
-      return res.status(400).json({ error: `label must be ${TRANSACTION_LABEL_MAX} characters or fewer` });
+    if (label.length > NOTE_MAX_LENGTH) {
+      return res.status(400).json({ error: `label must be ${NOTE_MAX_LENGTH} characters or fewer` });
     }
     const userId = req.userId;
     const result = await pool.query(
@@ -2524,25 +2565,56 @@ app.patch('/api/transactions/:id/category', async (req, res) => {
     }
     const choice = parseCategoryChoice(req.body);
     if (!choice) return res.status(400).json({ error: 'Invalid category choice' });
-    const result = await pool.query(
-      `UPDATE transactions SET user_pfc_primary = $1, user_category_label = $2, user_category_color = $3
-       WHERE id = $4 AND user_id = $5
-       RETURNING merchant_key, COALESCE(merchant_name, name) AS merchant_label`,
-      [choice.pfcPrimary, choice.customLabel, choice.customColor, req.params.id, userId]
-    );
-    if (result.rows.length === 0) return res.status(404).json({ error: 'Transaction not found' });
-    const { merchant_key: merchantKey, merchant_label: merchantLabel } = result.rows[0];
-    if (req.body?.applyToMerchant && merchantKey) {
-      await pool.query(
-        `INSERT INTO category_rules (user_id, merchant_key, merchant_label, pfc_primary, category_label, category_color)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (user_id, merchant_key) DO UPDATE SET
-           merchant_label = EXCLUDED.merchant_label,
-           pfc_primary = EXCLUDED.pfc_primary,
-           category_label = EXCLUDED.category_label,
-           category_color = EXCLUDED.category_color`,
-        [userId, merchantKey, merchantLabel, choice.pfcPrimary, choice.customLabel, choice.customColor]
+
+    // Both writes in one transaction when applyToMerchant is set - a crash between them
+    // would leave the per-transaction override applied but the "always categorize this
+    // merchant" rule silently missing, with no error surfaced to the user (the sibling
+    // multi-table write, PATCH /api/categories/:id, already gets this treatment; this route
+    // didn't - found by a correctness audit). The plain single-UPDATE path (no
+    // applyToMerchant) doesn't need a client/BEGIN - one statement is already atomic.
+    if (!req.body?.applyToMerchant) {
+      const result = await pool.query(
+        'UPDATE transactions SET user_pfc_primary = $1, user_category_label = $2, user_category_color = $3 WHERE id = $4 AND user_id = $5 RETURNING id',
+        [choice.pfcPrimary, choice.customLabel, choice.customColor, req.params.id, userId]
       );
+      if (result.rows.length === 0) return res.status(404).json({ error: 'Transaction not found' });
+      return res.json({ ok: true });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query(
+        `UPDATE transactions SET user_pfc_primary = $1, user_category_label = $2, user_category_color = $3
+         WHERE id = $4 AND user_id = $5
+         RETURNING merchant_key, COALESCE(merchant_name, name) AS merchant_label`,
+        [choice.pfcPrimary, choice.customLabel, choice.customColor, req.params.id, userId]
+      );
+      if (result.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Transaction not found' });
+      }
+      const { merchant_key: merchantKey, merchant_label: merchantLabel } = result.rows[0];
+      // Silently skipped (not an error), same as before - nothing to key a rule on when
+      // this particular transaction has no merchant_key.
+      if (merchantKey) {
+        await client.query(
+          `INSERT INTO category_rules (user_id, merchant_key, merchant_label, pfc_primary, category_label, category_color)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           ON CONFLICT (user_id, merchant_key) DO UPDATE SET
+             merchant_label = EXCLUDED.merchant_label,
+             pfc_primary = EXCLUDED.pfc_primary,
+             category_label = EXCLUDED.category_label,
+             category_color = EXCLUDED.category_color`,
+          [userId, merchantKey, merchantLabel, choice.pfcPrimary, choice.customLabel, choice.customColor]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
     }
     res.json({ ok: true });
   } catch (err) {
