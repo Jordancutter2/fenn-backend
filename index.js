@@ -1441,8 +1441,33 @@ app.get('/api/search', async (req, res) => {
     // injection either way), but there's no reason to run an ILIKE scan against an
     // unbounded string.
     const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 100) : '';
-    if (q.length < 2) return res.json({ transactions: [], manual: [] });
-    const like = `%${q}%`;
+
+    // Category/date are optional filters, independent of q - unlike q, which has always
+    // required 2+ characters before running any query at all, a filter alone (browsing
+    // "every Food & Drink charge, all time" with no text typed) is a real, useful mode on
+    // its own, not just a refinement of a text search. Passed as null (not omitted) to
+    // Postgres when absent, matched below via an `$n::type IS NULL OR ...` guard on each -
+    // one query shape handles "no filter," "text only," "filter only," and "both" without
+    // building SQL dynamically per combination.
+    const category = typeof req.query.category === 'string' && req.query.category ? req.query.category : null;
+    if (category && category !== 'CUSTOM' && !CATEGORY_KEYS.includes(category)) {
+      return res.status(400).json({ error: 'Invalid category filter' });
+    }
+    const categoryLabel =
+      category === 'CUSTOM' && typeof req.query.categoryLabel === 'string' && req.query.categoryLabel
+        ? req.query.categoryLabel
+        : null;
+    if (category === 'CUSTOM' && !categoryLabel) {
+      return res.status(400).json({ error: 'categoryLabel is required when category is CUSTOM' });
+    }
+    const start = typeof req.query.start === 'string' && req.query.start ? req.query.start : null;
+    const end = typeof req.query.end === 'string' && req.query.end ? req.query.end : null;
+    if ((start && !isValidDateKey(start)) || (end && !isValidDateKey(end))) {
+      return res.status(400).json({ error: 'start and end must be valid YYYY-MM-DD dates' });
+    }
+
+    if (q.length < 2 && !category && !start && !end) return res.json({ transactions: [], manual: [] });
+    const like = q.length >= 2 ? `%${q}%` : null;
     const p2pExcluded = await getP2PTransfersExcluded(userId);
 
     const [txns, manual] = await Promise.all([
@@ -1467,19 +1492,54 @@ app.get('/api/search', async (req, res) => {
          FROM transactions t
          JOIN plaid_items pi ON pi.id = t.plaid_item_id
          LEFT JOIN category_rules cr ON cr.user_id = t.user_id AND cr.merchant_key = t.merchant_key
-         WHERE t.user_id = $1 AND (t.merchant_name ILIKE $2 OR t.name ILIKE $2)
+         WHERE t.user_id = $1
+           AND ($2::text IS NULL OR t.merchant_name ILIKE $2 OR t.name ILIKE $2)
+           AND ($9::date IS NULL OR t.date >= $9)
+           AND ($10::date IS NULL OR t.date <= $10)
+           -- Same override -> merchant rule -> Plaid default precedence as every other
+           -- category read in this file (see /api/transactions' own COALESCE order) - a
+           -- category filter has to resolve a row's category the same way the app displays
+           -- it, or "Food & Drink" here could silently disagree with what search results
+           -- actually show.
+           AND ($11::text IS NULL OR COALESCE(t.user_pfc_primary, cr.pfc_primary, t.pfc_primary) = $11)
+           AND (
+             $11::text IS DISTINCT FROM 'CUSTOM' OR $12::text IS NULL OR
+             CASE
+               WHEN t.user_pfc_primary = 'CUSTOM' THEN t.user_category_label
+               WHEN t.user_pfc_primary IS NULL AND cr.pfc_primary = 'CUSTOM' THEN cr.category_label
+               ELSE NULL
+             END = $12
+           )
          ORDER BY t.date DESC, t.id
          LIMIT 50`,
-        [userId, like, AUTO_EXCLUDED_PFC_PRIMARY, AUTO_EXCLUDED_PFC_DETAILED, PFC_DETAILED_P2P_OUT, p2pExcluded, PFC_DETAILED_P2P_IN, P2P_NAME_PATTERN]
+        [
+          userId,
+          like,
+          AUTO_EXCLUDED_PFC_PRIMARY,
+          AUTO_EXCLUDED_PFC_DETAILED,
+          PFC_DETAILED_P2P_OUT,
+          p2pExcluded,
+          PFC_DETAILED_P2P_IN,
+          P2P_NAME_PATTERN,
+          start,
+          end,
+          category,
+          categoryLabel,
+        ]
       ),
       pool.query(
         `SELECT id, amount, note, to_char(local_date, 'YYYY-MM-DD') AS local_date, occurred_at,
                 pfc_primary, category_label, category_color
          FROM manual_expenses
-         WHERE user_id = $1 AND note ILIKE $2
+         WHERE user_id = $1
+           AND ($2::text IS NULL OR note ILIKE $2)
+           AND ($3::date IS NULL OR local_date >= $3)
+           AND ($4::date IS NULL OR local_date <= $4)
+           AND ($5::text IS NULL OR pfc_primary = $5)
+           AND ($5::text IS DISTINCT FROM 'CUSTOM' OR $6::text IS NULL OR category_label = $6)
          ORDER BY occurred_at DESC
          LIMIT 50`,
-        [userId, like]
+        [userId, like, start, end, category, categoryLabel]
       ),
     ]);
 
