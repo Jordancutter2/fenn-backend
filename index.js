@@ -2276,6 +2276,101 @@ app.post('/api/categories', async (req, res) => {
   }
 });
 
+// Renames a custom category (and/or recolors it) - unlike a plain re-create via POST above,
+// this propagates to every row already wearing the old label (transactions.
+// user_category_label/color, manual_expenses.category_label/color, category_rules.
+// category_label/color, all matched by the old label text since none of them hold a real
+// foreign key back to custom_categories.id - see that table's own schema comment on why
+// they're snapshots). A typo in a category name should get fixed everywhere it was already
+// used, not just for categorizations made after the fix - the opposite of DELETE below,
+// where leaving already-categorized rows alone is the right call instead.
+app.patch('/api/categories/:id', async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid category id' });
+    }
+    const label = typeof req.body?.label === 'string' ? req.body.label.trim() : '';
+    const color = typeof req.body?.color === 'string' ? req.body.color.trim() : '';
+    if (!label || label.length > CUSTOM_CATEGORY_LABEL_MAX) {
+      return res.status(400).json({ error: `label is required, ${CUSTOM_CATEGORY_LABEL_MAX} characters or fewer` });
+    }
+    if (!HEX_COLOR_PATTERN.test(color)) {
+      return res.status(400).json({ error: 'color must be a 6-digit hex value, e.g. #4C5FF0' });
+    }
+    const userId = req.userId;
+    const existing = await pool.query('SELECT label FROM custom_categories WHERE id = $1 AND user_id = $2', [
+      req.params.id,
+      userId,
+    ]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Category not found' });
+    const oldLabel = existing.rows[0].label;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('UPDATE custom_categories SET label = $1, color = $2 WHERE id = $3 AND user_id = $4', [
+        label,
+        color,
+        req.params.id,
+        userId,
+      ]);
+      await client.query(
+        `UPDATE transactions SET user_category_label = $1, user_category_color = $2
+         WHERE user_id = $3 AND user_pfc_primary = 'CUSTOM' AND user_category_label = $4`,
+        [label, color, userId, oldLabel]
+      );
+      await client.query(
+        `UPDATE manual_expenses SET category_label = $1, category_color = $2
+         WHERE user_id = $3 AND pfc_primary = 'CUSTOM' AND category_label = $4`,
+        [label, color, userId, oldLabel]
+      );
+      await client.query(
+        `UPDATE category_rules SET category_label = $1, category_color = $2
+         WHERE user_id = $3 AND pfc_primary = 'CUSTOM' AND category_label = $4`,
+        [label, color, userId, oldLabel]
+      );
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+    res.json({ id: Number(req.params.id), label, color });
+  } catch (err) {
+    // A unique_violation here means the new label collides with a different custom
+    // category this user already has - a clean 409 instead of the raw constraint error a
+    // bare 500 would otherwise surface.
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'You already have a category with that name' });
+    }
+    console.error(err);
+    res.status(500).json({ error: 'Failed to rename category' });
+  }
+});
+
+// Removes a custom category from the reusable list only - already-categorized transactions/
+// manual expenses/merchant rules keep showing their own label/color snapshot untouched (see
+// the schema comment on custom_categories), so deleting "Pets" to tidy up the picker doesn't
+// silently blank out every transaction that was ever tagged with it. It just stops being
+// offered as an option for anything recategorized after this.
+app.delete('/api/categories/:id', async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid category id' });
+    }
+    const result = await pool.query('DELETE FROM custom_categories WHERE id = $1 AND user_id = $2 RETURNING id', [
+      req.params.id,
+      req.userId,
+    ]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Category not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete category' });
+  }
+});
+
 // The user's own standing "always categorize X as Y" merchant rules (see category_rules'
 // own schema comment) - a settings-level management list, so a rule created in passing from
 // a recategorize sheet doesn't become permanently invisible/un-removable.
