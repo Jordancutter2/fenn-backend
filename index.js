@@ -1359,10 +1359,10 @@ app.get('/api/transactions', async (req, res) => {
         // for the same reason excluded already is - so a P2P-in's income status can defer
         // to users.p2p_transfers_excluded ($7) the moment there's no individual override,
         // without the frontend needing to know that setting exists at all.
-        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pending, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, pi.institution_name,
+        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, COALESCE(t.user_amount, t.amount) AS amount, t.pending, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, pi.institution_name,
            t.user_label, t.user_pfc_primary, t.user_category_label, t.user_category_color,
            CASE
-             WHEN t.amount <= 0 THEN true
+             WHEN COALESCE(t.user_amount, t.amount) <= 0 THEN true
              WHEN t.user_excluded IS NOT NULL THEN t.user_excluded
              WHEN t.is_recurring_bill THEN true
              WHEN (t.pfc_detailed = $6 OR t.name ~* $9) THEN $7
@@ -1372,7 +1372,7 @@ app.get('/api/transactions', async (req, res) => {
            END AS excluded,
            CASE
              WHEN t.user_income_excluded IS NOT NULL THEN t.user_income_excluded
-             WHEN (t.pfc_detailed = $8 OR (t.amount < 0 AND t.name ~* $9)) THEN $7
+             WHEN (t.pfc_detailed = $8 OR (COALESCE(t.user_amount, t.amount) < 0 AND t.name ~* $9)) THEN $7
              ELSE false
            END AS user_income_excluded
          FROM transactions t
@@ -1394,7 +1394,7 @@ app.get('/api/transactions', async (req, res) => {
       // DATE column serializes as a full ISO timestamp, not the plain 'YYYY-MM-DD' every
       // date-string helper in the app expects). This fallback branch (no date/start/end
       // query params) had been missed when that fix was made for the ranged branch.
-      `SELECT id, to_char(date, 'YYYY-MM-DD') AS date, name, merchant_name, amount, pending, pfc_primary, pfc_detailed, user_excluded,
+      `SELECT id, to_char(date, 'YYYY-MM-DD') AS date, name, merchant_name, COALESCE(user_amount, amount) AS amount, pending, pfc_primary, pfc_detailed, user_excluded,
               user_label, user_pfc_primary, user_category_label, user_category_color
        FROM transactions WHERE user_id = $1 ORDER BY date DESC LIMIT 100`,
       [userId]
@@ -1426,10 +1426,10 @@ app.get('/api/search', async (req, res) => {
 
     const [txns, manual] = await Promise.all([
       pool.query(
-        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, t.amount, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, pi.institution_name,
+        `SELECT t.id, to_char(t.date, 'YYYY-MM-DD') AS date, t.name, t.merchant_name, COALESCE(t.user_amount, t.amount) AS amount, t.pfc_primary, t.pfc_detailed, t.is_recurring_bill, pi.institution_name,
            t.user_label, t.user_pfc_primary, t.user_category_label, t.user_category_color,
            CASE
-             WHEN t.amount <= 0 THEN true
+             WHEN COALESCE(t.user_amount, t.amount) <= 0 THEN true
              WHEN t.user_excluded IS NOT NULL THEN t.user_excluded
              WHEN t.is_recurring_bill THEN true
              WHEN (t.pfc_detailed = $5 OR t.name ~* $8) THEN $6
@@ -1439,7 +1439,7 @@ app.get('/api/search', async (req, res) => {
            END AS excluded,
            CASE
              WHEN t.user_income_excluded IS NOT NULL THEN t.user_income_excluded
-             WHEN (t.pfc_detailed = $7 OR (t.amount < 0 AND t.name ~* $8)) THEN $6
+             WHEN (t.pfc_detailed = $7 OR (COALESCE(t.user_amount, t.amount) < 0 AND t.name ~* $8)) THEN $6
              ELSE false
            END AS user_income_excluded
          FROM transactions t
@@ -2097,6 +2097,41 @@ app.patch('/api/expenses/:id/category', async (req, res) => {
   }
 });
 
+// Corrects a manual expense's amount - unlike a synced transaction, there's no Plaid value
+// underneath to override, so this updates the real column directly (same reasoning as the
+// label route above updating `note` directly). Same sign-preservation rule as the
+// transactions version: fixing a wrong magnitude, not turning the entry from an expense
+// into income or back.
+app.patch('/api/expenses/:id/amount', async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid expense id' });
+    }
+    const amount = Number(req.body?.amount);
+    if (!Number.isFinite(amount) || amount === 0 || Math.abs(amount) > MAX_MONEY_AMOUNT) {
+      return res.status(400).json({ error: `amount must be a nonzero number, magnitude up to ${MAX_MONEY_AMOUNT}` });
+    }
+    const userId = req.userId;
+    const existing = await pool.query('SELECT amount FROM manual_expenses WHERE id = $1 AND user_id = $2', [
+      req.params.id,
+      userId,
+    ]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Expense not found' });
+    if (Math.sign(amount) !== Math.sign(Number(existing.rows[0].amount))) {
+      return res.status(400).json({ error: 'amount must keep the same sign as the original entry' });
+    }
+    await pool.query('UPDATE manual_expenses SET amount = $1 WHERE id = $2 AND user_id = $3', [
+      amount,
+      req.params.id,
+      userId,
+    ]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update expense amount' });
+  }
+});
+
 // The user's own saved custom categories ("Pets", "Subscriptions", ...) - the menu the
 // category picker offers alongside the built-in CATEGORY_KEYS list, and what "add a new
 // category" writes to.
@@ -2246,6 +2281,53 @@ app.patch('/api/transactions/:id/category', async (req, res) => {
   }
 });
 
+// Overrides a synced transaction's amount - same survive-the-next-sync reasoning as
+// label/category above, but with real teeth: unlike those two, amount feeds directly into
+// spend totals and exclusion rules (COUNTS_TOWARD_SPEND, /api/spend, /api/spend/daily, the
+// excluded/user_income_excluded CASEs above), all of which read COALESCE(user_amount,
+// amount) - so this actually changes what counts, not just what's displayed. Passing
+// amount: null clears the override, reverting to Plaid's own value. Sign must match the
+// row's real Plaid amount - this is for fixing a wrong magnitude (a mis-parsed amount, a
+// split charge), not for turning a purchase into income or vice versa; that's a
+// recategorization the UI doesn't offer via a plain amount edit.
+app.patch('/api/transactions/:id/amount', async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid transaction id' });
+    }
+    const userId = req.userId;
+    if (req.body?.amount === null) {
+      const result = await pool.query(
+        'UPDATE transactions SET user_amount = NULL WHERE id = $1 AND user_id = $2 RETURNING id',
+        [req.params.id, userId]
+      );
+      if (result.rows.length === 0) return res.status(404).json({ error: 'Transaction not found' });
+      return res.json({ ok: true });
+    }
+    const amount = Number(req.body?.amount);
+    if (!Number.isFinite(amount) || amount === 0 || Math.abs(amount) > MAX_MONEY_AMOUNT) {
+      return res.status(400).json({ error: `amount must be a nonzero number, magnitude up to ${MAX_MONEY_AMOUNT}` });
+    }
+    const existing = await pool.query('SELECT amount FROM transactions WHERE id = $1 AND user_id = $2', [
+      req.params.id,
+      userId,
+    ]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Transaction not found' });
+    if (Math.sign(amount) !== Math.sign(Number(existing.rows[0].amount))) {
+      return res.status(400).json({ error: 'amount must keep the same sign as the original transaction' });
+    }
+    const result = await pool.query('UPDATE transactions SET user_amount = $1 WHERE id = $2 AND user_id = $3 RETURNING id', [
+      amount,
+      req.params.id,
+      userId,
+    ]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update transaction amount' });
+  }
+});
+
 // Total spend in a date range (inclusive), combining manual expenses and synced
 // transactions, after applying the automatic category rules and any per-transaction
 // override. The client supplies the date range so timezone/"what day is today" stays a
@@ -2273,7 +2355,7 @@ app.patch('/api/transactions/:id/category', async (req, res) => {
 // signal recognized as P2P at all.
 const COUNTS_TOWARD_SPEND = `
   (
-    t.amount > 0
+    COALESCE(t.user_amount, t.amount) > 0
     AND (
       t.user_excluded = false
       OR (
@@ -2307,7 +2389,7 @@ app.get('/api/spend', async (req, res) => {
     // tables) - run together instead of one after another.
     const [plaidResult, manualResult] = await Promise.all([
       pool.query(
-        `SELECT COALESCE(SUM(t.amount), 0) AS total FROM transactions t
+        `SELECT COALESCE(SUM(COALESCE(t.user_amount, t.amount)), 0) AS total FROM transactions t
          WHERE t.user_id = $1
            AND t.date BETWEEN $2 AND $3
            AND ${COUNTS_TOWARD_SPEND}`,
@@ -2350,7 +2432,7 @@ app.get('/api/spend/daily', async (req, res) => {
       `SELECT gs::date AS date, COALESCE(t.total, 0) + COALESCE(m.total, 0) AS spent
        FROM generate_series($2::date, $3::date, interval '1 day') AS gs
        LEFT JOIN (
-         SELECT t.date, SUM(t.amount) AS total FROM transactions t
+         SELECT t.date, SUM(COALESCE(t.user_amount, t.amount)) AS total FROM transactions t
          WHERE t.user_id = $1 AND t.date BETWEEN $2 AND $3
            AND ${COUNTS_TOWARD_SPEND}
          GROUP BY t.date

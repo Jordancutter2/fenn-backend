@@ -207,6 +207,17 @@ ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_pfc_primary TEXT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_category_label TEXT;
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_category_color TEXT;
 
+-- Same override pattern as user_label above, for a corrected dollar amount (a Plaid
+-- mis-parse, or a split charge only part of which was really the user's own spend). Unlike
+-- label/category, amount feeds directly into spend totals and exclusion rules server-side
+-- (COUNTS_TOWARD_SPEND, /api/spend, /api/spend/daily, the excluded/user_income_excluded
+-- CASEs on /api/transactions and /api/search) - every one of those now reads
+-- COALESCE(user_amount, amount) instead of the raw column, so an edit actually changes what
+-- counts, not just what's displayed. Always the same sign as the underlying amount (the
+-- PATCH .../amount route rejects a sign flip) - editing is for fixing a wrong magnitude,
+-- not turning a purchase into income or vice versa.
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS user_amount NUMERIC(12, 2);
+
 -- Recurring bills, detected via Plaid's /transactions/recurring/get (outflow streams only -
 -- recurring income isn't a "bill"). Excluded from daily spend per the spec, shown in their
 -- own view instead. Refreshed by calling /api/sync_recurring, not on every regular sync -
