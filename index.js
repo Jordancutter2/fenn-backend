@@ -81,16 +81,21 @@ const app = express();
 // Required for express-rate-limit (and req.ip generally) to see the real client IP rather
 // than one of Railway's own internal proxy hops - without this every request looks like
 // it's coming from the same (or, worse, a rotating pool of) address, which breaks per-IP
-// rate limiting entirely. A temporary debug endpoint showed Railway's internal hop count
-// isn't a fixed number worth hardcoding (a hop's own IP changed between two otherwise
-// identical requests, implying a pool of edge nodes, not one stable proxy) - trusting the
-// whole forwarded chain is the standard fix for platforms like this. Safe specifically
-// because Railway is the only possible ingress to this container: nothing reaches it
-// without passing through Railway's edge first, and a legitimate reverse proxy always
-// overwrites (never appends to) any X-Forwarded-For a client tries to supply, so the
-// leftmost entry this app ends up trusting is one Railway itself observed, not one a
-// client could forge.
-app.set('trust proxy', true);
+// rate limiting entirely. This used to be `true` (trust the whole forwarded chain) on the
+// theory that a legitimate reverse proxy always overwrites, never appends to, an incoming
+// X-Forwarded-For - but that's backwards: appending is the actual X-Forwarded-For
+// convention (every hop, including Railway's edge, is expected to append its own observed
+// client IP onto whatever the header already said), so `true` let a request arrive with a
+// forged `X-Forwarded-For: <anything>` and have that spoofed value, not Railway's own
+// observation, treated as the trusted client IP - defeating every IP-keyed rate limiter
+// below (login, MFA, password reset). express-rate-limit ships a dedicated check
+// (ERR_ERL_PERMISSIVE_TRUST_PROXY) specifically warning against `trust proxy: true` for
+// this reason. A numeric hop count fixes this: it takes the entry N positions in from the
+// *socket* end of the chain, which a client can prepend to but never overwrite, regardless
+// of which specific edge node (Railway's pool of edge IPs vary run to run, but the hop
+// count itself is one - Railway sits its container behind exactly one reverse proxy, the
+// same shape Express's own docs use `1` for). Found by a correctness/security audit.
+app.set('trust proxy', 1);
 
 // Baseline security headers (X-Content-Type-Options, X-Frame-Options, a default
 // Content-Security-Policy, HSTS, etc.) on every response. The one incidental cost:
@@ -791,8 +796,12 @@ app.post('/revenuecat-webhook', revenueCatWebhookLimiter, async (req, res) => {
   // the move (the new account gains paid, the old one - if it still exists at all - loses
   // it) rather than a single id gaining or losing tier.
   if (isTransfer) {
-    const toIds = (event.transferred_to || []).map(Number).filter(Number.isInteger);
-    const fromIds = (event.transferred_from || []).map(Number).filter(Number.isInteger);
+    // isValidId, not just Number.isInteger - an id past PG_INT_MAX passes isInteger fine
+    // but overflows the users.id column at the query layer below, turning into a raw
+    // Postgres range error instead of just quietly skipping the one bad id. Found by a
+    // correctness audit.
+    const toIds = (event.transferred_to || []).filter((v) => isValidId(String(v))).map(Number);
+    const fromIds = (event.transferred_from || []).filter((v) => isValidId(String(v))).map(Number);
     try {
       if (toIds.length) {
         await pool.query('UPDATE users SET tier = $1, billing_issue_since = NULL WHERE id = ANY($2)', ['paid', toIds]);
@@ -808,7 +817,7 @@ app.post('/revenuecat-webhook', revenueCatWebhookLimiter, async (req, res) => {
     return res.sendStatus(200);
   }
 
-  const userId = /^\d+$/.test(String(appUserId)) ? Number(appUserId) : null;
+  const userId = isValidId(String(appUserId)) ? Number(appUserId) : null;
   if (!userId) {
     console.error(`[revenuecat webhook] non-numeric app_user_id: ${appUserId}`);
     if (logId) await pool.query('UPDATE revenuecat_webhook_log SET result = $1 WHERE id = $2', ['INVALID_APP_USER_ID', logId]);
@@ -2930,6 +2939,14 @@ app.use((err, req, res, next) => {
   // ever ends up missing its own try/catch (an easy mistake in a file this size) would
   // otherwise have its deliberately-set status/message/code silently discarded here too,
   // on top of already missing its intended catch. Confirmed via a correctness audit.
+  // express.json()'s own parse failure is the one case with a status but a message not
+  // meant for a client - the raw body-parser message (e.g. "Unexpected token o in JSON at
+  // position 1"), unlike every other route's deliberately-written err.message. Not
+  // sensitive, just inconsistent with this app's otherwise hand-written error copy. Found
+  // by a correctness audit.
+  if (err.type === 'entity.parse.failed') {
+    return res.status(err.status || 400).json({ error: 'Invalid request body' });
+  }
   res.status(err.status || 500).json({ error: err.status ? err.message : 'Internal error', code: err.code });
 });
 
