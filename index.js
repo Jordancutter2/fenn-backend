@@ -1655,6 +1655,9 @@ app.post('/api/sync_recurring', requirePaidTier, async (req, res) => {
         // streams - used below to clear is_recurring_bill from anything that dropped out,
         // since nothing else in this loop ever un-flags a transaction once flagged.
         const currentTransactionIds = [];
+        // Same idea, for the recurring_bills rows themselves - see the cleanup query below
+        // this loop for why.
+        const currentStreamIds = [];
 
         for (const stream of response.data.outflow_streams) {
           // Belt-and-suspenders: outflow_streams should already exclude income/refunds
@@ -1709,6 +1712,7 @@ app.post('/api/sync_recurring', requirePaidTier, async (req, res) => {
               stream.personal_finance_category?.detailed ?? null,
             ]
           );
+          currentStreamIds.push(stream.stream_id);
 
           if (stream.transaction_ids.length > 0) {
             currentTransactionIds.push(...stream.transaction_ids);
@@ -1753,6 +1757,23 @@ app.post('/api/sync_recurring', requirePaidTier, async (req, res) => {
              AND t.user_id = $2
              AND NOT (t.plaid_transaction_id = ANY($3))`,
           [item.id, userId, currentTransactionIds]
+        );
+
+        // Same reasoning as the transaction cleanup just above, one level up: the
+        // ON CONFLICT upsert in the loop above only ever touches a recurring_bills row for
+        // a stream_id Plaid's response actually still includes THIS sync. Plaid's own
+        // recurring-detector periodically re-evaluates which streams still qualify, and a
+        // stream that simply stops being returned (as opposed to being sent back with
+        // is_active: false, which the upsert above already handles correctly) previously
+        // left its row frozen at is_active = true with stale amounts/dates forever - a
+        // "ghost" bill still showing in /api/bills, permanently out of sync with the fact
+        // its own linked transactions were already correctly un-flagged by the query above.
+        // Found by a correctness audit.
+        await pool.query(
+          `UPDATE recurring_bills
+           SET is_active = false, updated_at = now()
+           WHERE plaid_item_id = $1 AND is_active = true AND NOT (stream_id = ANY($2))`,
+          [item.id, currentStreamIds]
         );
 
         await pool.query('UPDATE plaid_items SET recurring_synced_at = now() WHERE id = $1', [item.id]);
@@ -2588,10 +2609,23 @@ app.patch('/api/transactions/:id/category', async (req, res) => {
     // applyToMerchant) doesn't need a client/BEGIN - one statement is already atomic.
     if (!req.body?.applyToMerchant) {
       const result = await pool.query(
-        'UPDATE transactions SET user_pfc_primary = $1, user_category_label = $2, user_category_color = $3 WHERE id = $4 AND user_id = $5 RETURNING id',
+        'UPDATE transactions SET user_pfc_primary = $1, user_category_label = $2, user_category_color = $3 WHERE id = $4 AND user_id = $5 RETURNING id, recurring_bill_id',
         [choice.pfcPrimary, choice.customLabel, choice.customColor, req.params.id, userId]
       );
       if (result.rows.length === 0) return res.status(404).json({ error: 'Transaction not found' });
+      // Cascades a built-in category choice to the bill this transaction is linked to -
+      // recurring_bills.pfc_primary is Plaid's own classification of the bill's aggregate
+      // stream and was never touched by recategorizing one of its transactions, so the
+      // Bills tab could permanently show a different category than what the user just set
+      // for the same merchant in History/Search. Skipped for CUSTOM: recurring_bills has
+      // no category_label/category_color columns to snapshot a custom category into (only
+      // transactions/manual_expenses do), so writing bare 'CUSTOM' with nothing to render
+      // alongside it would just trade one display inconsistency for a worse one. Found by
+      // a correctness audit.
+      const { recurring_bill_id: recurringBillId } = result.rows[0];
+      if (recurringBillId && choice.pfcPrimary !== 'CUSTOM') {
+        await pool.query('UPDATE recurring_bills SET pfc_primary = $1 WHERE id = $2', [choice.pfcPrimary, recurringBillId]);
+      }
       return res.json({ ok: true });
     }
 
@@ -2601,14 +2635,19 @@ app.patch('/api/transactions/:id/category', async (req, res) => {
       const result = await client.query(
         `UPDATE transactions SET user_pfc_primary = $1, user_category_label = $2, user_category_color = $3
          WHERE id = $4 AND user_id = $5
-         RETURNING merchant_key, COALESCE(merchant_name, name) AS merchant_label`,
+         RETURNING merchant_key, COALESCE(merchant_name, name) AS merchant_label, recurring_bill_id`,
         [choice.pfcPrimary, choice.customLabel, choice.customColor, req.params.id, userId]
       );
       if (result.rows.length === 0) {
         await client.query('ROLLBACK');
         return res.status(404).json({ error: 'Transaction not found' });
       }
-      const { merchant_key: merchantKey, merchant_label: merchantLabel } = result.rows[0];
+      const { merchant_key: merchantKey, merchant_label: merchantLabel, recurring_bill_id: recurringBillId } = result.rows[0];
+      // Same recurring_bills cascade as the non-applyToMerchant path above - see its own
+      // comment for why CUSTOM is skipped.
+      if (recurringBillId && choice.pfcPrimary !== 'CUSTOM') {
+        await client.query('UPDATE recurring_bills SET pfc_primary = $1 WHERE id = $2', [choice.pfcPrimary, recurringBillId]);
+      }
       // Silently skipped (not an error), same as before - nothing to key a rule on when
       // this particular transaction has no merchant_key.
       if (merchantKey) {
