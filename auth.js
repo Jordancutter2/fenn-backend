@@ -150,6 +150,13 @@ async function register({ email, password, marketingConsent }) {
     throw insertErr;
   }
   const user = result.rows[0];
+  // Always true here - this function just created the hash above. See getMe's own comment
+  // for what this field is for; every other fresh-auth response (login, Apple, MFA verify)
+  // was missing it too until this same audit found the gap, silently hiding "Change
+  // password"/"Forgot your password?" in Settings right after any of those, not just for
+  // an Apple-only account that genuinely has no password to reset. Found by a correctness
+  // audit.
+  user.has_password = true;
   const token = await createSession(user.id);
   return { token, user };
 }
@@ -184,7 +191,13 @@ async function login({ email, password }) {
     // 247 weeks) for an account with little real spending, the exact same underlying
     // failure mode already documented and fixed once for daily streaks specifically, just
     // via a different root cause this time.
-    user: { id: user.id, email: user.email, tier: user.tier, created_at: user.created_at },
+    // has_password: true, not omitted - guaranteed true by the check above (this function
+    // never reaches here without a real password_hash match), but omitting it entirely
+    // (as this response used to) reads as false/undefined on the frontend, hiding "Change
+    // password"/"Forgot your password?" in Settings right after every fresh login, until
+    // the next full app relaunch's getMe() call happened to correct it. Found by a
+    // correctness audit.
+    user: { id: user.id, email: user.email, tier: user.tier, created_at: user.created_at, has_password: true },
     mfaRequired: user.mfa_enabled,
   };
 }
@@ -387,16 +400,22 @@ async function loginWithApple({ identityToken, email: emailFromClient, marketing
   const email = normalizeEmail(payload.email || emailFromClient || null);
 
   // created_at included in every branch below - see login()'s own comment for why it
-  // has to be there, not just cosmetic.
-  let result = await pool.query('SELECT id, email, tier, mfa_enabled, created_at FROM users WHERE apple_user_id = $1', [
-    appleUserId,
-  ]);
+  // has to be there, not just cosmetic. has_password too, for the same reason as
+  // register()/login()'s own fix - an Apple sign-in can land on an account that already
+  // has a real password (this exact "link to an existing email/password account" branch
+  // just below is precisely that case), and omitting it hid "Change password"/"Forgot your
+  // password?" in Settings even for someone who genuinely has a password to manage. Found
+  // by a correctness audit.
+  let result = await pool.query(
+    'SELECT id, email, tier, mfa_enabled, created_at, (password_hash IS NOT NULL) AS has_password FROM users WHERE apple_user_id = $1',
+    [appleUserId]
+  );
   if (result.rows.length > 0) {
     const user = result.rows[0];
     const token = await createSession(user.id, !user.mfa_enabled);
     return {
       token,
-      user: { id: user.id, email: user.email, tier: user.tier, created_at: user.created_at },
+      user: { id: user.id, email: user.email, tier: user.tier, created_at: user.created_at, has_password: user.has_password },
       mfaRequired: user.mfa_enabled,
     };
   }
@@ -405,14 +424,17 @@ async function loginWithApple({ identityToken, email: emailFromClient, marketing
   // email/password account with the same email if there is one, rather than
   // silently creating a duplicate account for the same person.
   if (email) {
-    result = await pool.query('SELECT id, email, tier, mfa_enabled, created_at FROM users WHERE email = $1', [email]);
+    result = await pool.query(
+      'SELECT id, email, tier, mfa_enabled, created_at, (password_hash IS NOT NULL) AS has_password FROM users WHERE email = $1',
+      [email]
+    );
     if (result.rows.length > 0) {
       const user = result.rows[0];
       await pool.query('UPDATE users SET apple_user_id = $1 WHERE id = $2', [appleUserId, user.id]);
       const token = await createSession(user.id, !user.mfa_enabled);
       return {
         token,
-        user: { id: user.id, email: user.email, tier: user.tier, created_at: user.created_at },
+        user: { id: user.id, email: user.email, tier: user.tier, created_at: user.created_at, has_password: user.has_password },
         mfaRequired: user.mfa_enabled,
       };
     }
@@ -480,6 +502,11 @@ async function loginWithApple({ identityToken, email: emailFromClient, marketing
     throw insertErr;
   }
   const user = insertResult.rows[0];
+  // Explicitly false, not just omitted - a brand new Apple-only account genuinely has no
+  // password (this INSERT never sets one), so this one's correctly falsy either way, but
+  // stating it matches the other two branches above now doing the same and doesn't rely on
+  // the frontend treating undefined the same as false.
+  user.has_password = false;
   const token = await createSession(user.id);
   return { token, user };
 }
@@ -611,7 +638,8 @@ async function disableMfa(userId, password) {
 // already has the right token, it just couldn't use it for anything else yet.
 async function verifyMfaLogin(token, code) {
   const result = await pool.query(
-    `SELECT s.id AS session_id, s.mfa_verified, u.id AS user_id, u.email, u.tier, u.mfa_secret, u.created_at
+    `SELECT s.id AS session_id, s.mfa_verified, u.id AS user_id, u.email, u.tier, u.mfa_secret, u.created_at,
+            (u.password_hash IS NOT NULL) AS has_password
      FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token = $1`,
     [hashToken(token)]
@@ -624,8 +652,10 @@ async function verifyMfaLogin(token, code) {
   }
 
   // created_at included here too - see login()'s own comment for why it has to be, not
-  // just cosmetic.
-  const user = { id: row.user_id, email: row.email, tier: row.tier, created_at: row.created_at };
+  // just cosmetic. has_password too - MFA is available to both password and Apple-only
+  // accounts, so (unlike login()'s own guaranteed-true case) this one genuinely needs the
+  // real per-account value, not a hardcoded one. Found by a correctness audit.
+  const user = { id: row.user_id, email: row.email, tier: row.tier, created_at: row.created_at, has_password: row.has_password };
   if (row.mfa_verified) {
     // Already verified (e.g. a retried request) - idempotent success, not an error, and
     // not a guess against anything - doesn't touch mfa_attempts.
