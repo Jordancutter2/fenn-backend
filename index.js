@@ -1045,6 +1045,20 @@ app.post('/api/exchange_public_token', requirePaidTier, async (req, res) => {
     const { public_token, institution_name, institution_id } = req.body;
     const userId = req.userId;
 
+    // MAX_INSTITUTIONS mirrors app/LinkedBanks.js's own client-side constant ("hard
+    // ceiling per the spec - paid tier, no higher tier to raise it") - previously only
+    // enforced by hiding the "Connect a bank" button once the client's own item count hit
+    // this number, with nothing here stopping a 6th+ connection from a stale client, a
+    // client bug, or a direct API call. Checked before the real Plaid exchange below, same
+    // reasoning as the duplicate-Item pre-check just after it - no reason to burn a real
+    // itemPublicTokenExchange call for a connection that's getting rejected either way.
+    // Found by a correctness audit.
+    const MAX_INSTITUTIONS = 5;
+    const countResult = await pool.query('SELECT COUNT(*) FROM plaid_items WHERE user_id = $1', [userId]);
+    if (Number(countResult.rows[0].count) >= MAX_INSTITUTIONS) {
+      return res.status(400).json({ error: `You can connect up to ${MAX_INSTITUTIONS} banks.` });
+    }
+
     // Per Plaid's own duplicate-Item guidance: check before exchanging, not after - an
     // exchanged-then-discarded Item still counts as a connection for billing purposes.
     // institution_id (not the display name) is the reliable match key here.
