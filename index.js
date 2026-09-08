@@ -235,6 +235,38 @@ const revenueCatWebhookLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// Every route below this point (see `app.use('/api', requireAuth)` further down) only
+// ever had requireAuth itself as a gate - no rate limit at all. That's fine against outside
+// abuse (nothing here is a guessable secret the way login is), but it left a real
+// same-origin denial-of-service risk: db.js's own Postgres pool caps out at 10 connections,
+// and one already-authenticated free-tier account hammering any query-heavy route (e.g.
+// /api/search, two ILIKE scans per call) with enough concurrency can exhaust that whole
+// pool - every OTHER user's request then queues and fails once connectionTimeoutMillis
+// elapses, a site-wide outage caused by a single account, not just a self-inflicted one.
+// Keyed by req.userId (set by requireAuth, which always runs before this on every matched
+// route), not IP - the point is bounding what one authenticated account can do, not IP
+// hygiene, and userId is exact where IP can be shared/spoofed. Generous limit, same
+// "real but not tight" reasoning as webhookLimiter above - this exists to stop a runaway
+// script or a bug in a future client build from taking the whole service down, not to
+// throttle normal UI usage, which comes nowhere close to this in practice.
+//
+// Applied two ways: `app.use('/api', apiLimiter)` below covers the bulk of routes (every
+// one registered after that line), but Express matches routes in registration order, so
+// the handful of authenticated routes registered ABOVE that blanket mount (logout, me,
+// p2p-transfers-excluded, mfa/setup) would otherwise never reach it - those get this same
+// limiter passed inline instead, the same way they already get requireAuth inline. The
+// other pre-blanket authenticated routes (change-password, mfa/confirm, mfa/disable,
+// account deletion) already carry loginLimiter, which is strictly tighter, so adding this
+// on top of those would be redundant.
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.userId,
+  message: { error: 'Too many requests. Try again in a few minutes.' },
+});
+
 // node-postgres parses DATE columns into JS Date objects using the *local* timezone of
 // this process, not UTC. Reading the date back out with local getters (not toISOString,
 // which is UTC) correctly reverses that regardless of what timezone this server runs in.
@@ -334,13 +366,13 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
   }
 });
 
-app.post('/api/auth/logout', requireAuth, async (req, res) => {
+app.post('/api/auth/logout', requireAuth, apiLimiter, async (req, res) => {
   const header = req.headers.authorization || '';
   await logout(header.slice(7));
   res.json({ ok: true });
 });
 
-app.get('/api/auth/me', requireAuth, async (req, res) => {
+app.get('/api/auth/me', requireAuth, apiLimiter, async (req, res) => {
   // has_password (not the hash itself, which never leaves the server) lets the frontend
   // decide whether "Change password" makes sense to show at all - an Apple-only account
   // has no password to change.
@@ -360,12 +392,12 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
 // recap notifications, streak mode) - each independently fetched/persisted rather than
 // threaded through the shared user object. See COUNTS_TOWARD_SPEND and /api/transactions
 // for where this actually gets read.
-app.get('/api/settings/p2p-transfers-excluded', requireAuth, async (req, res) => {
+app.get('/api/settings/p2p-transfers-excluded', requireAuth, apiLimiter, async (req, res) => {
   const excluded = await getP2PTransfersExcluded(req.userId);
   res.json({ excluded });
 });
 
-app.patch('/api/settings/p2p-transfers-excluded', requireAuth, async (req, res) => {
+app.patch('/api/settings/p2p-transfers-excluded', requireAuth, apiLimiter, async (req, res) => {
   try {
     await pool.query('UPDATE users SET p2p_transfers_excluded = $1 WHERE id = $2', [
       !!req.body?.excluded,
@@ -405,7 +437,7 @@ app.post('/api/auth/change-password', requireAuth, loginLimiter, async (req, res
 
 // Step 1 of turning on MFA: returns a QR code for the user's authenticator app. Doesn't
 // take effect until /api/auth/mfa/confirm proves the user actually saved it.
-app.post('/api/auth/mfa/setup', requireAuth, async (req, res) => {
+app.post('/api/auth/mfa/setup', requireAuth, apiLimiter, async (req, res) => {
   try {
     const userResult = await pool.query('SELECT email FROM users WHERE id = $1', [req.userId]);
     const { qrDataUrl, manualEntryKey } = await setupMfa(req.userId, userResult.rows[0].email);
@@ -525,6 +557,10 @@ app.delete('/api/account', requireAuth, loginLimiter, async (req, res) => {
 
 // Everything below this point requires a valid session.
 app.use('/api', requireAuth);
+// req.userId only exists once requireAuth (just above) has run - must be mounted after it,
+// not before, or keyGenerator would always see undefined and every user would share one
+// bucket.
+app.use('/api', apiLimiter);
 
 // Free tier is manual-entry only per the spec - Plaid sync is the paid feature.
 async function requirePaidTier(req, res, next) {
@@ -1012,8 +1048,13 @@ app.post('/api/plaid_items/:id/reconnected', async (req, res) => {
 // hammer for "I connected the wrong bank." Removed on Plaid's side first (so billing
 // stops), then the row is deleted, which cascades to that bank's transactions and
 // recurring bills only - webhook_log needs its own explicit cleanup, same reasoning as
-// account deletion above.
-app.delete('/api/plaid_items/:id', async (req, res) => {
+// account deletion above. authLimiter, same as every other Plaid-calling route not gated
+// by its own tighter cap - this hits Plaid's own itemRemove API on every call with no
+// server-side debounce of its own (unlike sync_transactions/sync_recurring, which have a
+// real per-item debounce bounding actual Plaid calls regardless of request rate). Found
+// missing by a security audit - create_link_token already carries this same limiter for
+// the identical reason.
+app.delete('/api/plaid_items/:id', authLimiter, async (req, res) => {
   try {
     if (!isValidId(req.params.id)) {
       return res.status(400).json({ error: 'Invalid bank connection id' });
@@ -1049,7 +1090,9 @@ app.delete('/api/plaid_items/:id', async (req, res) => {
 
 // Step 2: once the user finishes Plaid Link, the front-end sends us the public_token.
 // We exchange it for a long-lived access_token and save it against the user's row.
-app.post('/api/exchange_public_token', requirePaidTier, async (req, res) => {
+// authLimiter - same "hits Plaid's API with no local debounce" reasoning as create_link_token
+// and the DELETE route just above. Found missing by a security audit.
+app.post('/api/exchange_public_token', requirePaidTier, authLimiter, async (req, res) => {
   try {
     const { public_token, institution_name, institution_id } = req.body;
     const userId = req.userId;

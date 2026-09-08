@@ -32,7 +32,12 @@ const MIN_PASSWORD_LENGTH = 8;
 // dominant cost on these paths; JS's short-circuit && previously skipped it entirely when
 // no user/code was found, and that timing gap leaked account/code existence even though
 // both paths return the identical error message.
-const DUMMY_PASSWORD_HASH = bcrypt.hashSync('fenn-timing-safety-dummy', 10);
+// Cost 12, matching every real bcrypt.hash call below (bumped together from 10 - OWASP's
+// floor, not its recommended target - as part of a security audit) - this dummy exists
+// specifically so a miss takes the same wall-clock time as a real bcrypt.compare, which
+// only holds if both run at the same cost factor. Leaving this one behind at the old cost
+// would reintroduce exactly the timing side-channel this constant exists to close.
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync('fenn-timing-safety-dummy', 12);
 
 // Shared by register() and changePassword() - the only two places a password is ever set -
 // so a weak password can't slip in through either path. Length only, not composition
@@ -128,7 +133,7 @@ async function register({ email, password, marketingConsent }) {
     throw err;
   }
 
-  const passwordHash = await bcrypt.hash(password, 10);
+  const passwordHash = await bcrypt.hash(password, 12);
   let result;
   try {
     result = await pool.query(
@@ -137,7 +142,7 @@ async function register({ email, password, marketingConsent }) {
       [email, passwordHash, !!marketingConsent]
     );
   } catch (insertErr) {
-    // The SELECT above only catches the common case - bcrypt.hash takes real time (10
+    // The SELECT above only catches the common case - bcrypt.hash takes real time (12
     // rounds), long enough for two overlapping register requests (a double-tap, a client
     // timeout-then-retry) to both pass that check before either INSERT commits. Without
     // this, the loser hit the generic "Failed to register" 500 instead of the same clean
@@ -225,7 +230,7 @@ async function changePassword(userId, currentPassword, newPassword, currentSessi
     throw err;
   }
 
-  const newHash = await bcrypt.hash(newPassword, 10);
+  const newHash = await bcrypt.hash(newPassword, 12);
 
   // Both statements in one transaction - split across two separate auto-committed queries,
   // a crash between them (rare, but Railway restarts/deploys happen) could leave the new
@@ -290,7 +295,7 @@ async function requestPasswordReset(email) {
   if (!user || !user.password_hash) return;
 
   const code = generateResetCode();
-  const codeHash = await bcrypt.hash(code, 10);
+  const codeHash = await bcrypt.hash(code, 12);
   const expiresAt = new Date(Date.now() + RESET_CODE_EXPIRY_MS);
   await pool.query('INSERT INTO password_reset_codes (user_id, code_hash, expires_at) VALUES ($1, $2, $3)', [
     user.id,
@@ -370,7 +375,7 @@ async function resetPassword({ email, code, newPassword }) {
     invalidCodeError();
   }
 
-  const newHash = await bcrypt.hash(newPassword, 10);
+  const newHash = await bcrypt.hash(newPassword, 12);
   await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, user.id]);
   await pool.query('UPDATE password_reset_codes SET used_at = now() WHERE id = $1', [resetRow.id]);
 
@@ -580,7 +585,7 @@ async function confirmMfa(userId, code) {
   for (let i = 0; i < BACKUP_CODE_COUNT; i++) {
     const backupCode = generateBackupCode();
     backupCodes.push(backupCode);
-    codeHashes.push(await bcrypt.hash(backupCode, 10));
+    codeHashes.push(await bcrypt.hash(backupCode, 12));
   }
 
   // One transaction, not three separately-committed statements - a crash partway through

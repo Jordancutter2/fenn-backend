@@ -3,6 +3,14 @@ const { Pool } = require('pg');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  // Explicit, not left to DATABASE_URL's own sslmode=require - pg-connection-string treats
+  // 'require' as "encrypt, but don't verify the server's certificate" (rejectUnauthorized:
+  // false), which stops a plaintext downgrade but not a MITM presenting any self-signed
+  // cert. Explicit rejectUnauthorized: true here restores real certificate validation on
+  // top of the encryption - confirmed working against the actual production Neon endpoint
+  // (Neon's cert validates against Node's standard trusted CA store, no custom CA needed)
+  // before this shipped, not just assumed. Found by a security audit.
+  ssl: { rejectUnauthorized: true },
   // Explicit, not just pg's own defaults left implicit - max/idleTimeoutMillis happen to
   // match what pg already defaults to, but connectionTimeoutMillis doesn't (pg's own
   // default is 0, meaning a request waiting on a connection when the pool's exhausted

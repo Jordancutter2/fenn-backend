@@ -16,7 +16,7 @@ const PRIVACY_POLICY = {
     },
     {
       heading: 'How we share it',
-      body: "With Plaid, Inc., to connect to and retrieve data from your bank on your behalf. With RevenueCat, to process Fenn Plus subscription purchases. With Sentry, to diagnose app crashes. With Neon and Railway, our database and server hosting providers, who store data on our behalf under their own security commitments. We do not sell your data, and we do not share it with advertisers.",
+      body: "With Plaid, Inc., to connect to and retrieve data from your bank on your behalf. With RevenueCat, to process Fenn Plus subscription purchases. With Resend, to deliver account-related emails like password resets. With Sentry, to diagnose app crashes. With Neon and Railway, our database and server hosting providers, who store data on our behalf under their own security commitments. We do not sell your data, and we do not share it with advertisers.",
     },
     {
       heading: 'Security',
@@ -24,7 +24,7 @@ const PRIVACY_POLICY = {
     },
     {
       heading: 'Your choices',
-      body: 'You can disconnect a bank account at any time from Settings. You can delete your account at any time from Settings, which permanently and immediately deletes your budget, expenses, and bank connections. You can control which notifications you receive from Settings.',
+      body: 'You can disconnect a bank account at any time from Settings. You can delete your account at any time from Settings, which permanently and immediately deletes your budget, expenses, and bank connections. Subscription and billing records are retained after account deletion for financial record-keeping, as is standard practice. You can control which notifications you receive from Settings.',
     },
     {
       heading: "Children's privacy",
