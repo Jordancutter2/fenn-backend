@@ -1717,6 +1717,30 @@ app.post('/api/sync_recurring', requirePaidTier, async (req, res) => {
           // stream that isn't a genuine positive-amount recurring expense.
           if (!(stream.average_amount?.amount > 0)) continue;
 
+          // If any transaction Plaid just grouped into this stream is already linked to
+          // an active manual bill (see POST /api/bills/mark_recurring), Plaid's own
+          // detector has now caught up on the exact same real-world charge. The
+          // transaction-linking UPDATE below always repoints those transactions to THIS
+          // stream's row regardless of what they were linked to before (a stream's
+          // membership is Plaid's own ground truth, not something to leave stale) - so
+          // without retiring the manual row here, it silently keeps refreshing forever
+          // via the manual-bill last_amount/last_date query below (which matches on
+          // merchant_key alone, not actual linkage) even though nothing is linked to it
+          // anymore: a duplicate "ghost" bill for the same charge. Found live: the
+          // student loan bill marked recurring manually earlier this session, once
+          // Plaid's own detector picked it up too.
+          let supersededManualBill = null;
+          if (stream.transaction_ids.length > 0) {
+            const superseded = await pool.query(
+              `SELECT DISTINCT rb.id, rb.user_included FROM recurring_bills rb
+               JOIN transactions t ON t.recurring_bill_id = rb.id
+               WHERE rb.user_id = $1 AND rb.is_manual = true AND rb.is_active = true
+                 AND t.plaid_transaction_id = ANY($2)`,
+              [userId, stream.transaction_ids]
+            );
+            supersededManualBill = superseded.rows[0] || null;
+          }
+
           const billResult = await pool.query(
             `INSERT INTO recurring_bills
                (user_id, plaid_item_id, stream_id, merchant_name, description, average_amount, last_amount, frequency, last_date, is_active, pfc_primary, pfc_detailed, updated_at)
@@ -1765,6 +1789,26 @@ app.post('/api/sync_recurring', requirePaidTier, async (req, res) => {
             ]
           );
           currentStreamIds.push(stream.stream_id);
+
+          if (supersededManualBill && supersededManualBill.id !== billResult.rows[0].id) {
+            await pool.query(
+              `UPDATE recurring_bills SET is_active = false, updated_at = now() WHERE id = $1`,
+              [supersededManualBill.id]
+            );
+            // Carries the user's own include/exclude choice on the manual bill forward
+            // rather than letting it silently reset to the default the instant Plaid
+            // takes over - same reasoning as /api/bills/:id/include's own cascade to
+            // linked transactions, just at the bill level. Mutated in place (not just in
+            // the DB) so the transaction-linking cascade just below, which reads
+            // billResult.rows[0].user_included, sees the transferred value too.
+            if (supersededManualBill.user_included && !billResult.rows[0].user_included) {
+              await pool.query(
+                `UPDATE recurring_bills SET user_included = true, updated_at = now() WHERE id = $1`,
+                [billResult.rows[0].id]
+              );
+              billResult.rows[0].user_included = true;
+            }
+          }
 
           if (stream.transaction_ids.length > 0) {
             currentTransactionIds.push(...stream.transaction_ids);
