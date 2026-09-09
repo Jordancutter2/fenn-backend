@@ -1821,10 +1821,14 @@ app.post('/api/sync_recurring', requirePaidTier, async (req, res) => {
         // "ghost" bill still showing in /api/bills, permanently out of sync with the fact
         // its own linked transactions were already correctly un-flagged by the query above.
         // Found by a correctness audit.
+        //
+        // AND is_manual = false - a manually-created bill (see POST /api/bills/mark_recurring)
+        // uses a synthetic stream_id that will never appear in Plaid's own currentStreamIds,
+        // which would otherwise deactivate it on this item's very next sync.
         await pool.query(
           `UPDATE recurring_bills
            SET is_active = false, updated_at = now()
-           WHERE plaid_item_id = $1 AND is_active = true AND NOT (stream_id = ANY($2))`,
+           WHERE plaid_item_id = $1 AND is_active = true AND NOT (stream_id = ANY($2)) AND is_manual = false`,
           [item.id, currentStreamIds]
         );
 
@@ -1834,6 +1838,49 @@ app.post('/api/sync_recurring', requirePaidTier, async (req, res) => {
       }
       })
     );
+
+    // Manual bills (see POST /api/bills/mark_recurring) aren't tied to Plaid's own stream
+    // detection at all, so they need their own linking step here - once per whole sync
+    // call, covering every item's newly-synced transactions uniformly, rather than
+    // repeating this per item above (a manual bill's own plaid_item_id is just wherever its
+    // origin transaction happened to come from, not a scope any future matching transaction
+    // is bound to). Same two jobs Plaid's own per-stream linking does just above: link any
+    // new matching transaction that isn't already part of a bill, and keep last_amount/
+    // last_date (and previous_amount, for the same price-increase-alert behavior Plaid
+    // bills already get) current as newer occurrences come in.
+    try {
+      await pool.query(
+        `UPDATE transactions t
+         SET is_recurring_bill = true, recurring_bill_id = rb.id
+         FROM recurring_bills rb
+         WHERE rb.user_id = $1 AND rb.is_manual = true AND rb.is_active = true
+           AND t.user_id = $1 AND t.merchant_key = rb.merchant_key AND t.recurring_bill_id IS NULL`,
+        [userId]
+      );
+      await pool.query(
+        `WITH newest AS (
+           SELECT DISTINCT ON (merchant_key) merchant_key, amount, date
+           FROM transactions
+           WHERE user_id = $1 AND merchant_key IS NOT NULL
+           ORDER BY merchant_key, date DESC
+         )
+         UPDATE recurring_bills rb
+         SET last_amount = newest.amount,
+             last_date = newest.date,
+             previous_amount = CASE
+               WHEN newest.amount - rb.last_amount >= GREATEST(1, rb.last_amount * 0.02)
+               THEN rb.last_amount
+               ELSE rb.previous_amount
+             END,
+             updated_at = now()
+         FROM newest
+         WHERE rb.user_id = $1 AND rb.is_manual = true AND rb.is_active = true
+           AND newest.merchant_key = rb.merchant_key AND newest.date > rb.last_date`,
+        [userId]
+      );
+    } catch (err) {
+      console.error('sync_recurring manual-bill matching failed:', err);
+    }
 
     res.json({ ok: true });
   } catch (err) {
@@ -1892,6 +1939,102 @@ app.get('/api/bills', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to fetch bills' });
+  }
+});
+
+// Subset of Plaid's own recurring-stream frequency vocabulary (matches formatFrequency on
+// the frontend) - SEMI_MONTHLY and UNKNOWN excluded, not meaningful choices for someone
+// hand-picking a frequency the way Plaid's own detector would only ever infer them.
+const MANUAL_BILL_FREQUENCIES = ['WEEKLY', 'BIWEEKLY', 'MONTHLY', 'ANNUALLY'];
+
+// Manually flags one transaction (and every other transaction sharing its merchant_key) as
+// a recurring bill, for a real recurring charge Plaid's own transactionsRecurringGet
+// hasn't classified as a stream - that's Plaid's own ML model, entirely outside this app's
+// control, and can take several qualifying occurrences (or never fire at all, if the real-
+// world interval isn't perfectly regular) before it catches something a person can see is
+// obviously recurring immediately. Retroactively links every past matching, not-yet-linked
+// transaction so the new bill's history is complete right away, not just going forward -
+// sync_recurring's own manual-bill matching step (see its own comment there) keeps linking
+// future ones the same way Plaid's transaction_ids linking already does for its own bills.
+app.post('/api/bills/mark_recurring', requirePaidTier, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { transactionId, frequency } = req.body || {};
+    if (!isValidId(transactionId)) {
+      return res.status(400).json({ error: 'A valid transactionId is required.' });
+    }
+    if (!MANUAL_BILL_FREQUENCIES.includes(frequency)) {
+      return res.status(400).json({ error: `frequency must be one of ${MANUAL_BILL_FREQUENCIES.join(', ')}.` });
+    }
+
+    const txnResult = await pool.query(
+      `SELECT id, plaid_item_id, merchant_key, merchant_name, name, amount, date, pfc_primary, pfc_detailed, recurring_bill_id
+       FROM transactions WHERE id = $1 AND user_id = $2`,
+      [transactionId, userId]
+    );
+    const txn = txnResult.rows[0];
+    if (!txn) return res.status(404).json({ error: 'Transaction not found.' });
+    // No merchant_key at all (an empty/blank name after normalization - see its own
+    // NULLIF(LOWER(TRIM(...))) derivation in syncOneItem) means nothing to match future
+    // occurrences on, the same reason category_rules skips a transaction in this state.
+    if (!txn.merchant_key) {
+      return res.status(400).json({ error: "This transaction doesn't have enough merchant info to create a bill from." });
+    }
+    if (txn.recurring_bill_id) {
+      return res.status(409).json({ error: 'This transaction is already part of a bill.' });
+    }
+    // Negative/zero amount is a refund or deposit, not a charge - nothing to bill.
+    if (!(txn.amount > 0)) {
+      return res.status(400).json({ error: 'Only a real charge can be marked as a bill.' });
+    }
+
+    // Both writes in one transaction - a crash between them would leave a bill row with
+    // nothing linked to it (including the very transaction that was tapped to create it),
+    // same "must not disagree" reasoning as /api/bills/:id/include's own two-statement
+    // transaction just below.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const billResult = await client.query(
+        `INSERT INTO recurring_bills
+           (user_id, plaid_item_id, stream_id, merchant_name, description, average_amount, last_amount, frequency, last_date, is_active, pfc_primary, pfc_detailed, is_manual, merchant_key, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, true, $9, $10, true, $11, now())
+         RETURNING id`,
+        [
+          userId,
+          txn.plaid_item_id,
+          `manual-${txn.id}`,
+          txn.merchant_name || txn.name,
+          txn.name,
+          txn.amount,
+          frequency,
+          txn.date,
+          txn.pfc_primary,
+          txn.pfc_detailed,
+          txn.merchant_key,
+        ]
+      );
+      const billId = billResult.rows[0].id;
+
+      const linkResult = await client.query(
+        `UPDATE transactions
+         SET is_recurring_bill = true, recurring_bill_id = $1
+         WHERE user_id = $2 AND merchant_key = $3 AND recurring_bill_id IS NULL
+         RETURNING id`,
+        [billId, userId, txn.merchant_key]
+      );
+
+      await client.query('COMMIT');
+      res.json({ id: billId, linkedCount: linkResult.rows.length });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to mark this as a recurring bill.' });
   }
 });
 

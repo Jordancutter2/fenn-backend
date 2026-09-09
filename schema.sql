@@ -475,3 +475,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_revenuecat_webhook_log_event_id ON revenue
 -- NULL by any event that confirms the subscription is actually fine again (a successful
 -- RENEWAL, etc.) or that's already moot (EXPIRATION - they're downgraded either way).
 ALTER TABLE users ADD COLUMN IF NOT EXISTS billing_issue_since TIMESTAMPTZ;
+
+-- User-created bills, for a real recurring charge Plaid's own transactionsRecurringGet
+-- hasn't (yet, or ever) classified as a stream - the automatic detector is Plaid's own ML
+-- model, entirely outside this app's control, and can take a couple of qualifying
+-- occurrences (or simply never fire, if the interval isn't perfectly regular) before it
+-- catches something a person can see is obviously recurring immediately. is_manual = true
+-- exempts a row from sync_recurring's own ghost-bill cleanup (which otherwise deactivates
+-- any recurring_bills row whose stream_id isn't in Plaid's current stream list every sync -
+-- a manual bill's synthetic stream_id never will be) and from letting Plaid's own upsert
+-- ever overwrite it. merchant_key mirrors transactions.merchant_key's own normalization
+-- (lower/trim of merchant_name, falling back to name) so future transactions can be matched
+-- and linked automatically the same way Plaid's own transaction_ids linking already works,
+-- without introducing a second definition of "same merchant."
+ALTER TABLE recurring_bills ADD COLUMN IF NOT EXISTS is_manual BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE recurring_bills ADD COLUMN IF NOT EXISTS merchant_key TEXT;
+CREATE INDEX IF NOT EXISTS idx_recurring_bills_merchant_key ON recurring_bills(user_id, merchant_key) WHERE is_manual = true;
