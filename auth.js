@@ -162,6 +162,11 @@ async function register({ email, password, marketingConsent }) {
   // an Apple-only account that genuinely has no password to reset. Found by a correctness
   // audit.
   user.has_password = true;
+  // Always false here - MFA setup is a separate, later step (Settings > Two-factor
+  // authentication), never something registration itself turns on. Same gap as
+  // has_password just above, just for this field - see login()'s own comment for the full
+  // story (found live, by the user, on a real account).
+  user.mfa_enabled = false;
   const token = await createSession(user.id);
   return { token, user };
 }
@@ -202,7 +207,23 @@ async function login({ email, password }) {
     // password"/"Forgot your password?" in Settings right after every fresh login, until
     // the next full app relaunch's getMe() call happened to correct it. Found by a
     // correctness audit.
-    user: { id: user.id, email: user.email, tier: user.tier, created_at: user.created_at, has_password: true },
+    //
+    // mfa_enabled: same gap, same fix - already selected above to compute mfaRequired
+    // just below, but never actually included on the user object itself. Settings reads
+    // this field to show "Two-factor authentication: On/Off" - omitted, it reads as
+    // undefined/Off regardless of the real value, right after every fresh login, MFA-gated
+    // or not. Confirmed live: a real account with MFA genuinely on was correctly prompted
+    // for a code at login (mfaRequired was computed correctly, from the same query result)
+    // but Settings showed "Off" immediately after, since only the user object - never
+    // fixed until now - was missing the field. Found by the user, live.
+    user: {
+      id: user.id,
+      email: user.email,
+      tier: user.tier,
+      created_at: user.created_at,
+      has_password: true,
+      mfa_enabled: user.mfa_enabled,
+    },
     mfaRequired: user.mfa_enabled,
   };
 }
@@ -420,7 +441,14 @@ async function loginWithApple({ identityToken, email: emailFromClient, marketing
     const token = await createSession(user.id, !user.mfa_enabled);
     return {
       token,
-      user: { id: user.id, email: user.email, tier: user.tier, created_at: user.created_at, has_password: user.has_password },
+      user: {
+        id: user.id,
+        email: user.email,
+        tier: user.tier,
+        created_at: user.created_at,
+        has_password: user.has_password,
+        mfa_enabled: user.mfa_enabled,
+      },
       mfaRequired: user.mfa_enabled,
     };
   }
@@ -439,7 +467,14 @@ async function loginWithApple({ identityToken, email: emailFromClient, marketing
       const token = await createSession(user.id, !user.mfa_enabled);
       return {
         token,
-        user: { id: user.id, email: user.email, tier: user.tier, created_at: user.created_at, has_password: user.has_password },
+        user: {
+          id: user.id,
+          email: user.email,
+          tier: user.tier,
+          created_at: user.created_at,
+          has_password: user.has_password,
+          mfa_enabled: user.mfa_enabled,
+        },
         mfaRequired: user.mfa_enabled,
       };
     }
@@ -512,6 +547,9 @@ async function loginWithApple({ identityToken, email: emailFromClient, marketing
   // stating it matches the other two branches above now doing the same and doesn't rely on
   // the frontend treating undefined the same as false.
   user.has_password = false;
+  // Always false here too - same reasoning as register()'s own identical line, a brand
+  // new account has never been through MFA setup yet.
+  user.mfa_enabled = false;
   const token = await createSession(user.id);
   return { token, user };
 }
@@ -644,7 +682,7 @@ async function disableMfa(userId, password) {
 async function verifyMfaLogin(token, code) {
   const result = await pool.query(
     `SELECT s.id AS session_id, s.mfa_verified, u.id AS user_id, u.email, u.tier, u.mfa_secret, u.created_at,
-            (u.password_hash IS NOT NULL) AS has_password
+            u.mfa_enabled, (u.password_hash IS NOT NULL) AS has_password
      FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token = $1`,
     [hashToken(token)]
@@ -659,8 +697,20 @@ async function verifyMfaLogin(token, code) {
   // created_at included here too - see login()'s own comment for why it has to be, not
   // just cosmetic. has_password too - MFA is available to both password and Apple-only
   // accounts, so (unlike login()'s own guaranteed-true case) this one genuinely needs the
-  // real per-account value, not a hardcoded one. Found by a correctness audit.
-  const user = { id: row.user_id, email: row.email, tier: row.tier, created_at: row.created_at, has_password: row.has_password };
+  // real per-account value, not a hardcoded one. mfa_enabled too, for the same reason
+  // login()'s own fix needed it - the field itself was missing from every fresh-auth
+  // response, including this one, only ever used internally to gate whether this whole
+  // function got called at all, never actually handed to the client. Found live, by the
+  // user, on a real account: MFA correctly required at login (proving the backend had the
+  // right value all along) but Settings showed "Off" immediately after verifying it.
+  const user = {
+    id: row.user_id,
+    email: row.email,
+    tier: row.tier,
+    created_at: row.created_at,
+    has_password: row.has_password,
+    mfa_enabled: row.mfa_enabled,
+  };
   if (row.mfa_verified) {
     // Already verified (e.g. a retried request) - idempotent success, not an error, and
     // not a guess against anything - doesn't touch mfa_attempts.
