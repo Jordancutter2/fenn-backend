@@ -1893,35 +1893,51 @@ app.post('/api/sync_recurring', requirePaidTier, async (req, res) => {
     // last_date (and previous_amount, for the same price-increase-alert behavior Plaid
     // bills already get) current as newer occurrences come in.
     try {
-      await pool.query(
-        `UPDATE transactions t
-         SET is_recurring_bill = true, recurring_bill_id = rb.id
-         FROM recurring_bills rb
-         WHERE rb.user_id = $1 AND rb.is_manual = true AND rb.is_active = true
-           AND t.user_id = $1 AND t.merchant_key = rb.merchant_key AND t.recurring_bill_id IS NULL`,
+      // Cheap existence check first - the second query below full-scans and sorts every
+      // one of this user's transactions with a merchant_key (no date bound at all, and
+      // idx_transactions_user_merchant_key doesn't cover its ORDER BY date component) to
+      // compute a per-merchant "newest transaction" result the outer UPDATE then mostly
+      // throws away unless it actually joins to a manual bill. For a user with zero manual
+      // bills - the common case, since this feature is opt-in per bill - that whole scan
+      // was pure waste, unconditionally, on every single sync_recurring call, with a cost
+      // that grows with the user's full transaction history rather than their (typically
+      // small) linked-bank count. A years-old, high-volume account pays this on every
+      // Bills-tab visit for a feature it may have never used once. Found by a scale audit.
+      const hasManualBills = await pool.query(
+        `SELECT 1 FROM recurring_bills WHERE user_id = $1 AND is_manual = true AND is_active = true LIMIT 1`,
         [userId]
       );
-      await pool.query(
-        `WITH newest AS (
-           SELECT DISTINCT ON (merchant_key) merchant_key, amount, date
-           FROM transactions
-           WHERE user_id = $1 AND merchant_key IS NOT NULL
-           ORDER BY merchant_key, date DESC
-         )
-         UPDATE recurring_bills rb
-         SET last_amount = newest.amount,
-             last_date = newest.date,
-             previous_amount = CASE
-               WHEN newest.amount - rb.last_amount >= GREATEST(1, rb.last_amount * 0.02)
-               THEN rb.last_amount
-               ELSE rb.previous_amount
-             END,
-             updated_at = now()
-         FROM newest
-         WHERE rb.user_id = $1 AND rb.is_manual = true AND rb.is_active = true
-           AND newest.merchant_key = rb.merchant_key AND newest.date > rb.last_date`,
-        [userId]
-      );
+      if (hasManualBills.rows.length > 0) {
+        await pool.query(
+          `UPDATE transactions t
+           SET is_recurring_bill = true, recurring_bill_id = rb.id
+           FROM recurring_bills rb
+           WHERE rb.user_id = $1 AND rb.is_manual = true AND rb.is_active = true
+             AND t.user_id = $1 AND t.merchant_key = rb.merchant_key AND t.recurring_bill_id IS NULL`,
+          [userId]
+        );
+        await pool.query(
+          `WITH newest AS (
+             SELECT DISTINCT ON (merchant_key) merchant_key, amount, date
+             FROM transactions
+             WHERE user_id = $1 AND merchant_key IS NOT NULL
+             ORDER BY merchant_key, date DESC
+           )
+           UPDATE recurring_bills rb
+           SET last_amount = newest.amount,
+               last_date = newest.date,
+               previous_amount = CASE
+                 WHEN newest.amount - rb.last_amount >= GREATEST(1, rb.last_amount * 0.02)
+                 THEN rb.last_amount
+                 ELSE rb.previous_amount
+               END,
+               updated_at = now()
+           FROM newest
+           WHERE rb.user_id = $1 AND rb.is_manual = true AND rb.is_active = true
+             AND newest.merchant_key = rb.merchant_key AND newest.date > rb.last_date`,
+          [userId]
+        );
+      }
     } catch (err) {
       console.error('sync_recurring manual-bill matching failed:', err);
     }
@@ -2352,7 +2368,12 @@ app.get('/api/expenses', async (req, res) => {
     const rangeEnd = date || end;
     const result = await pool.query(
       // to_char, not a bare column - see the equivalent note on /api/transactions above.
-      "SELECT id, amount, note, to_char(local_date, 'YYYY-MM-DD') AS local_date, occurred_at, pfc_primary, category_label, category_color FROM manual_expenses WHERE user_id = $1 AND local_date BETWEEN $2 AND $3 ORDER BY occurred_at DESC",
+      // LIMIT 5000, matching the same safety cap the Plaid-transaction sibling endpoint
+      // already has (its own comment there explains why) - this one was found missing it
+      // entirely by a scale audit. Manual entries are typically far lower-volume than
+      // synced bank transactions, but a years-long free-tier account logging by hand had
+      // nothing bounding this query at all.
+      "SELECT id, amount, note, to_char(local_date, 'YYYY-MM-DD') AS local_date, occurred_at, pfc_primary, category_label, category_color FROM manual_expenses WHERE user_id = $1 AND local_date BETWEEN $2 AND $3 ORDER BY occurred_at DESC LIMIT 5000",
       [userId, rangeStart, rangeEnd]
     );
     res.json(result.rows);
