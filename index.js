@@ -45,6 +45,55 @@ function isValidDateKey(value) {
   return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(new Date(value).getTime());
 }
 
+// UTC-anchored, not local-timezone, parsing/formatting for a plain 'YYYY-MM-DD' date key -
+// a DATE column carries no timezone of its own, and the server has no business guessing
+// one (see manual_expenses.local_date's own comment on why every "which day" decision in
+// this app is either client-supplied or, as here, pure calendar arithmetic on the key
+// itself). Used only by nextOccurrenceDateKey below.
+function parseDateKeyUTC(dateKey) {
+  const [y, m, d] = dateKey.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d));
+}
+function formatDateKeyUTC(date) {
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(date.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+// Server-side mirror of predictNextCharge (app/BillsScreen.js) - same cycle math, kept in
+// sync by hand since one operates on a JS Date for display and this one on a plain date
+// key for storage/comparison. Used by POST /api/bills/run_auto_post to walk a bill forward
+// one cycle at a time when catching up on missed occurrences.
+function nextOccurrenceDateKey(dateKey, frequency) {
+  const next = parseDateKeyUTC(dateKey);
+  switch (frequency) {
+    case 'DAILY':
+      next.setUTCDate(next.getUTCDate() + 1);
+      break;
+    case 'WEEKLY':
+      next.setUTCDate(next.getUTCDate() + 7);
+      break;
+    case 'BIWEEKLY':
+      next.setUTCDate(next.getUTCDate() + 14);
+      break;
+    case 'ANNUALLY':
+      next.setUTCFullYear(next.getUTCFullYear() + 1);
+      break;
+    default: {
+      // MONTHLY - clamped to the target month's own last day rather than a bare
+      // setUTCMonth(), which silently overflows into the FOLLOWING month whenever the
+      // current day-of-month doesn't exist there (Jan 31 -> Mar 3 instead of Feb 28) -
+      // same bug, same fix, as predictNextCharge's own comment on this exact case.
+      const targetMonthIndex = next.getUTCMonth() + 1;
+      const lastDayOfTargetMonth = new Date(Date.UTC(next.getUTCFullYear(), targetMonthIndex + 1, 0)).getUTCDate();
+      const day = Math.min(next.getUTCDate(), lastDayOfTargetMonth);
+      return formatDateKeyUTC(new Date(Date.UTC(next.getUTCFullYear(), targetMonthIndex, day)));
+    }
+  }
+  return formatDateKeyUTC(next);
+}
+
 // Express route params are always strings - a non-numeric :id (typo'd, or someone poking
 // at the endpoint) previously fell straight through to a parameterized query, which
 // Postgres rejects as a type-cast error on an INTEGER column, caught generically as a bare
@@ -1931,6 +1980,13 @@ app.post('/api/sync_recurring', requirePaidTier, async (req, res) => {
                  THEN rb.last_amount
                  ELSE rb.previous_amount
                END,
+               -- A real transaction has now shown up for this merchant - going forward
+               -- its own charges are the ground truth, so auto-posting a synthetic
+               -- manual_expenses entry on top of them would double-count the same
+               -- real-world charge. Only ever turns this off, never back on - re-enabling
+               -- is a deliberate user action (the form this came from), not something a
+               -- sync should do on its own.
+               auto_post = false,
                updated_at = now()
            FROM newest
            WHERE rb.user_id = $1 AND rb.is_manual = true AND rb.is_active = true
@@ -2123,7 +2179,7 @@ app.post('/api/bills/mark_recurring', requirePaidTier, async (req, res) => {
 app.post('/api/bills/create_manual', requirePaidTier, async (req, res) => {
   try {
     const userId = req.userId;
-    const { label, amount: rawAmount, frequency, lastDate, pfcPrimary, included } = req.body || {};
+    const { label, amount: rawAmount, frequency, lastDate, pfcPrimary, included, autoPost } = req.body || {};
 
     const trimmedLabel = typeof label === 'string' ? label.trim() : '';
     if (!trimmedLabel || trimmedLabel.length > 60) {
@@ -2141,6 +2197,15 @@ app.post('/api/bills/create_manual', requirePaidTier, async (req, res) => {
     }
     if (!CATEGORY_KEYS.includes(pfcPrimary)) {
       return res.status(400).json({ error: 'A valid category is required.' });
+    }
+    // Auto-posting only ever makes sense together with counting toward budget - it exists
+    // to make a bill's real cost show up in the same day's spend it's meant to represent,
+    // which is meaningless for a bill that isn't counted at all. The client's own form
+    // already only offers this toggle once "Count toward budget" is on, so a request
+    // reaching here with autoPost true and included false/absent means the two got out of
+    // sync somehow - reject rather than silently drop one or the other.
+    if (autoPost && !included) {
+      return res.status(400).json({ error: 'autoPost requires included to also be true.' });
     }
 
     // Same normalization as transactions.merchant_key (see syncOneItem) - kept consistent
@@ -2166,16 +2231,99 @@ app.post('/api/bills/create_manual', requirePaidTier, async (req, res) => {
     const stream_id = `manual-adhoc-${crypto.randomBytes(8).toString('hex')}`;
     const billResult = await pool.query(
       `INSERT INTO recurring_bills
-         (user_id, plaid_item_id, stream_id, merchant_name, description, average_amount, last_amount, frequency, last_date, is_active, pfc_primary, is_manual, merchant_key, user_included, updated_at)
-       VALUES ($1, NULL, $2, $3, $3, $4, $4, $5, $6, true, $7, true, $8, $9, now())
+         (user_id, plaid_item_id, stream_id, merchant_name, description, average_amount, last_amount, frequency, last_date, is_active, pfc_primary, is_manual, merchant_key, user_included, auto_post, updated_at)
+       VALUES ($1, NULL, $2, $3, $3, $4, $4, $5, $6, true, $7, true, $8, $9, $10, now())
        RETURNING id`,
-      [userId, stream_id, trimmedLabel, amount, frequency, lastDate, pfcPrimary, merchantKey, !!included]
+      [userId, stream_id, trimmedLabel, amount, frequency, lastDate, pfcPrimary, merchantKey, !!included, !!autoPost]
     );
 
     res.json({ id: billResult.rows[0].id });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to create this recurring bill.' });
+  }
+});
+
+// Auto-posts a real manual_expenses row for each opted-in recurring bill (auto_post = true,
+// see AddRecurringBillModal's "Auto-add to spend" toggle) whose next cycle has come due -
+// "assign a day... every time that day comes up it will come up in the spend" per the
+// user's own request. Catches up on any number of missed cycles since last_posted_date (or
+// last_date, if never posted) up to today, not just the very next one - covers the case
+// the request explicitly named (the app not opened, or the backend down, for a while).
+//
+// today is supplied by the caller, not computed here - same reasoning as POST
+// /api/expenses' own local_date: the server intentionally never guesses a user's local
+// timezone, and this route has no other per-request context (unlike a normal write) to
+// infer it from.
+//
+// Re-checks user_included = true live in the WHERE clause rather than only at bill-
+// creation time - a bill the user later un-includes from "count toward budget" stops
+// auto-posting too, with no separate pause flag needed.
+app.post('/api/bills/run_auto_post', requirePaidTier, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { today } = req.body || {};
+    if (!isValidDateKey(today)) {
+      return res.status(400).json({ error: "today (YYYY-MM-DD, the device's local calendar date) is required" });
+    }
+
+    const client = await pool.connect();
+    let postedCount = 0;
+    try {
+      await client.query('BEGIN');
+      // FOR UPDATE - a second overlapping call (two devices open at once) blocks on this
+      // row lock until the first call's UPDATE below commits, then reads the now-current
+      // last_posted_date, so it can't independently compute the same "missed" occurrences
+      // and double-post them.
+      const bills = await client.query(
+        `SELECT id, to_char(last_date, 'YYYY-MM-DD') AS last_date,
+                to_char(last_posted_date, 'YYYY-MM-DD') AS last_posted_date,
+                frequency, merchant_name, pfc_primary,
+                CASE WHEN previous_amount IS NOT NULL THEN last_amount ELSE average_amount END AS display_amount
+         FROM recurring_bills
+         WHERE user_id = $1 AND is_active = true AND is_manual = true AND auto_post = true AND user_included = true
+         FOR UPDATE`,
+        [userId]
+      );
+
+      for (const bill of bills.rows) {
+        if (!bill.last_date || !(bill.display_amount > 0)) continue;
+        let cursor = bill.last_posted_date || bill.last_date;
+        const toPost = [];
+        // Safety valve, not a real limit - same LIMIT-5000-style philosophy as this file's
+        // other bulk-safety caps, for a pathological/long-neglected case (not normal use,
+        // where a session gap of a few missed cycles is the realistic worst case).
+        for (let i = 0; i < 1000; i++) {
+          const next = nextOccurrenceDateKey(cursor, bill.frequency);
+          if (next > today) break;
+          toPost.push(next);
+          cursor = next;
+        }
+        if (toPost.length === 0) continue;
+
+        for (const occurredOn of toPost) {
+          await client.query(
+            `INSERT INTO manual_expenses (user_id, amount, note, local_date, pfc_primary, recurring_bill_id)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [userId, bill.display_amount, bill.merchant_name, occurredOn, bill.pfc_primary, bill.id]
+          );
+        }
+        await client.query(`UPDATE recurring_bills SET last_posted_date = $1 WHERE id = $2`, [cursor, bill.id]);
+        postedCount += toPost.length;
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.json({ posted: postedCount });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to run auto-post' });
   }
 });
 

@@ -501,3 +501,26 @@ CREATE INDEX IF NOT EXISTS idx_recurring_bills_merchant_key ON recurring_bills(u
 -- true-from-scratch case, and every query that joins plaid_items for it (GET /api/bills)
 -- is updated to a LEFT JOIN accordingly.
 ALTER TABLE recurring_bills ALTER COLUMN plaid_item_id DROP NOT NULL;
+
+-- Optional per-bill auto-posting: "assign a day... every time that day comes up it will
+-- come up in the spend." Opt-in (default false, mirrors every other new-bill default on
+-- this table) and only meaningful together with user_included - POST
+-- /api/bills/run_auto_post's own WHERE clause re-checks user_included live on every call
+-- rather than freezing it at creation time, so turning "count toward budget" back off
+-- later pauses auto-posting too, with no separate pause flag needed. The "day" itself
+-- isn't a new field - it reuses last_date + frequency, the same cycle math
+-- predictNextCharge (app/BillsScreen.js) already predicts a next charge from for display.
+ALTER TABLE recurring_bills ADD COLUMN IF NOT EXISTS auto_post BOOLEAN NOT NULL DEFAULT false;
+-- Cursor for catch-up: the last occurrence date a manual_expenses row was actually created
+-- for. NULL means never auto-posted yet, so the first eligible occurrence is the one right
+-- after last_date, not last_date itself - last_date is the most recent time this was due
+-- BEFORE the bill was created/tracked here (already paid the user's own way), not
+-- something to retroactively post a duplicate entry for.
+ALTER TABLE recurring_bills ADD COLUMN IF NOT EXISTS last_posted_date DATE;
+
+-- Marks a manual_expenses row as one POST /api/bills/run_auto_post created automatically,
+-- rather than one the user logged by hand - never read by the app today (an auto-posted
+-- entry looks and behaves exactly like any other manual expense: editable, deletable,
+-- categorizable, same as the user's own), kept purely as a lineage/audit trail for a
+-- feature that creates real financial records with no direct per-occurrence user action.
+ALTER TABLE manual_expenses ADD COLUMN IF NOT EXISTS recurring_bill_id INTEGER REFERENCES recurring_bills(id);
