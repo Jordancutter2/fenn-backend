@@ -1987,9 +1987,15 @@ app.get('/api/bills', async (req, res) => {
       `SELECT rb.id, rb.merchant_name, rb.description, rb.average_amount, rb.last_amount, rb.frequency, to_char(rb.last_date, 'YYYY-MM-DD') AS last_date, rb.is_active, rb.user_included, rb.pfc_primary, rb.previous_amount,
               CASE WHEN rb.previous_amount IS NOT NULL THEN rb.last_amount ELSE rb.average_amount END AS display_amount
        FROM recurring_bills rb
-       JOIN plaid_items pi ON pi.id = rb.plaid_item_id
+       LEFT JOIN plaid_items pi ON pi.id = rb.plaid_item_id
        WHERE rb.user_id = $1 AND rb.is_active = true AND rb.average_amount > 0
-         AND rb.last_date >= pi.created_at::date - make_interval(days => $2)
+         -- pi.created_at is NULL for a from-scratch manual bill (see
+         -- POST /api/bills/create_manual - plaid_item_id is NULL, nothing to join to) -
+         -- the whole point of this floor is bounding a Plaid-derived bill to the window
+         -- Fenn actually imported for that connection, which doesn't apply to a bill with
+         -- no connection behind it at all, so it's skipped rather than excluding every
+         -- such bill outright.
+         AND (pi.created_at IS NULL OR rb.last_date >= pi.created_at::date - make_interval(days => $2))
          AND COALESCE(rb.pfc_primary, '') != ALL($3)
          AND COALESCE(rb.pfc_detailed, '') != ALL($4)
        ORDER BY rb.average_amount DESC`,
@@ -2004,8 +2010,11 @@ app.get('/api/bills', async (req, res) => {
 
 // Subset of Plaid's own recurring-stream frequency vocabulary (matches formatFrequency on
 // the frontend) - SEMI_MONTHLY and UNKNOWN excluded, not meaningful choices for someone
-// hand-picking a frequency the way Plaid's own detector would only ever infer them.
-const MANUAL_BILL_FREQUENCIES = ['WEEKLY', 'BIWEEKLY', 'MONTHLY', 'ANNUALLY'];
+// hand-picking a frequency the way Plaid's own detector would only ever infer them. DAILY
+// isn't one of Plaid's own stream frequencies at all (nothing it detects is ever daily),
+// but is a real, meaningful choice for a bill someone's hand-creating from scratch (POST
+// /api/bills/create_manual) - a daily parking fee, a daily coffee treated as a fixed cost.
+const MANUAL_BILL_FREQUENCIES = ['DAILY', 'WEEKLY', 'BIWEEKLY', 'MONTHLY', 'ANNUALLY'];
 
 // Manually flags one transaction (and every other transaction sharing its merchant_key) as
 // a recurring bill, for a real recurring charge Plaid's own transactionsRecurringGet
@@ -2095,6 +2104,78 @@ app.post('/api/bills/mark_recurring', requirePaidTier, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to mark this as a recurring bill.' });
+  }
+});
+
+// Creates a recurring bill from scratch - no existing transaction, no linked bank at all
+// required (plaid_item_id stays NULL - see its own schema comment on why that column had
+// to become nullable for this). For a real recurring cost on an account someone
+// deliberately hasn't connected to Fenn (the exact case that prompted this - "a bank
+// account you don't want to connect that just handles rent"). Deliberately does NOT
+// generate any actual spend entries going forward - it's tracked here the same way a
+// Plaid-detected or mark_recurring bill is (shows in Bills, counts toward the "fixed
+// bills" total, has its own include/exclude toggle), but nothing will ever automatically
+// reduce a day's remaining budget for it - the user still logs the real charge by hand
+// (a manual expense) whenever it actually happens, same as they always could have.
+// Custom categories aren't supported here (recurring_bills has no user_category_label/
+// color columns at all - it's never supported them, even for mark_recurring's own manual
+// bills), only a real built-in category.
+app.post('/api/bills/create_manual', requirePaidTier, async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { label, amount: rawAmount, frequency, lastDate, pfcPrimary, included } = req.body || {};
+
+    const trimmedLabel = typeof label === 'string' ? label.trim() : '';
+    if (!trimmedLabel || trimmedLabel.length > 60) {
+      return res.status(400).json({ error: 'label is required, 60 characters or fewer.' });
+    }
+    const amount = Number(rawAmount);
+    if (!Number.isFinite(amount) || amount <= 0 || amount > MAX_MONEY_AMOUNT) {
+      return res.status(400).json({ error: `amount must be a positive number, up to ${MAX_MONEY_AMOUNT}` });
+    }
+    if (!MANUAL_BILL_FREQUENCIES.includes(frequency)) {
+      return res.status(400).json({ error: `frequency must be one of ${MANUAL_BILL_FREQUENCIES.join(', ')}.` });
+    }
+    if (!isValidDateKey(lastDate)) {
+      return res.status(400).json({ error: 'lastDate (YYYY-MM-DD) is required - the most recent time this was due.' });
+    }
+    if (!CATEGORY_KEYS.includes(pfcPrimary)) {
+      return res.status(400).json({ error: 'A valid category is required.' });
+    }
+
+    // Same normalization as transactions.merchant_key (see syncOneItem) - kept consistent
+    // so if this same merchant/name ever does show up as a real synced transaction later
+    // (the user changes their mind and links that account after all), sync_recurring's own
+    // manual-bill matching (merchant_key equality) can still find and link it.
+    const merchantKey = trimmedLabel.toLowerCase();
+    if (!merchantKey) {
+      return res.status(400).json({ error: 'label must contain more than just whitespace.' });
+    }
+
+    // Blocks an accidental duplicate (the same rent bill created twice) - the merchant_key
+    // index on is_manual bills isn't a uniqueness constraint at the database level, so this
+    // is the only thing that would otherwise catch it.
+    const existing = await pool.query(
+      `SELECT id FROM recurring_bills WHERE user_id = $1 AND is_manual = true AND is_active = true AND merchant_key = $2`,
+      [userId, merchantKey]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: 'You already have an active recurring bill with this name.' });
+    }
+
+    const stream_id = `manual-adhoc-${crypto.randomBytes(8).toString('hex')}`;
+    const billResult = await pool.query(
+      `INSERT INTO recurring_bills
+         (user_id, plaid_item_id, stream_id, merchant_name, description, average_amount, last_amount, frequency, last_date, is_active, pfc_primary, is_manual, merchant_key, user_included, updated_at)
+       VALUES ($1, NULL, $2, $3, $3, $4, $4, $5, $6, true, $7, true, $8, $9, now())
+       RETURNING id`,
+      [userId, stream_id, trimmedLabel, amount, frequency, lastDate, pfcPrimary, merchantKey, !!included]
+    );
+
+    res.json({ id: billResult.rows[0].id });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to create this recurring bill.' });
   }
 });
 

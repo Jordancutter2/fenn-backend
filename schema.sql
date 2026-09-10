@@ -491,3 +491,13 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS billing_issue_since TIMESTAMPTZ;
 ALTER TABLE recurring_bills ADD COLUMN IF NOT EXISTS is_manual BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE recurring_bills ADD COLUMN IF NOT EXISTS merchant_key TEXT;
 CREATE INDEX IF NOT EXISTS idx_recurring_bills_merchant_key ON recurring_bills(user_id, merchant_key) WHERE is_manual = true;
+
+-- A manual bill created from scratch (POST /api/bills/create_manual - no existing
+-- transaction to mark, e.g. rent on an account the user doesn't want to link via Plaid at
+-- all) has no real bank connection to attach to, but plaid_item_id was NOT NULL from this
+-- table's very first version, back when every recurring_bills row necessarily came from a
+-- synced Plaid stream. The mark_recurring endpoint's own manual bills stay non-null (they
+-- use their origin transaction's real plaid_item_id) - this only ever goes NULL for the
+-- true-from-scratch case, and every query that joins plaid_items for it (GET /api/bills)
+-- is updated to a LEFT JOIN accordingly.
+ALTER TABLE recurring_bills ALTER COLUMN plaid_item_id DROP NOT NULL;
