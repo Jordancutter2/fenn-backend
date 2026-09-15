@@ -1800,7 +1800,11 @@ app.post('/api/sync_recurring', requirePaidTier, async (req, res) => {
                last_amount = EXCLUDED.last_amount,
                frequency = EXCLUDED.frequency,
                last_date = EXCLUDED.last_date,
-               is_active = EXCLUDED.is_active,
+               -- CASE, not a bare EXCLUDED.is_active - a bill the user explicitly merged
+               -- away (see POST /api/bills/:id/merge, and merged_away's own schema
+               -- comment) must stay inactive regardless of what Plaid keeps reporting for
+               -- its stream, or this upsert would silently resurrect it the very next sync.
+               is_active = CASE WHEN recurring_bills.merged_away THEN false ELSE EXCLUDED.is_active END,
                pfc_primary = EXCLUDED.pfc_primary,
                pfc_detailed = EXCLUDED.pfc_detailed,
                -- Records a price-increase alert when last_amount rose by at least $1 AND
@@ -2409,6 +2413,85 @@ app.delete('/api/bills/:id', requirePaidTier, async (req, res) => {
   }
 });
 
+// Combines two recurring-bill rows into one, for when the same real-world bill ended up
+// tracked as two separate ones - most commonly a merchant's billing descriptor changing,
+// which can make Plaid's own detector treat it as a brand-new stream with no continuity
+// from the old one, rather than an update to the existing one. :id (the URL param) is the
+// bill going away; targetId (the body) is the one that survives - works for any
+// combination of Plaid-detected, mark_recurring, and create_manual bills, unlike PATCH/
+// DELETE .../:id above, which are both scoped to manual bills only. The user is the one
+// confirming these are actually the same bill; nothing here tries to infer or validate
+// that on its own (no category/frequency similarity check) - same trust-the-explicit-
+// action reasoning DELETE above already applies.
+app.post('/api/bills/:id/merge', requirePaidTier, async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid bill id' });
+    }
+    const targetId = req.body?.targetId;
+    if (!isValidId(targetId)) {
+      return res.status(400).json({ error: 'A valid targetId is required.' });
+    }
+    if (String(targetId) === String(req.params.id)) {
+      return res.status(400).json({ error: 'Cannot merge a bill with itself.' });
+    }
+    const userId = req.userId;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      // FOR UPDATE on both rows in one query, ordered by id - avoids a deadlock against a
+      // concurrent merge attempt going the other direction (source/target swapped) at the
+      // same time, which would otherwise lock these same two rows in opposite order.
+      const ids = [req.params.id, targetId].sort((a, b) => Number(a) - Number(b));
+      const rows = await client.query(
+        `SELECT id, user_included FROM recurring_bills WHERE id = ANY($1) AND user_id = $2 AND is_active = true FOR UPDATE`,
+        [ids, userId]
+      );
+      const source = rows.rows.find((r) => String(r.id) === String(req.params.id));
+      const target = rows.rows.find((r) => String(r.id) === String(targetId));
+      if (!source || !target) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'One or both bills were not found.' });
+      }
+
+      await client.query(
+        `UPDATE recurring_bills SET is_active = false, merged_away = true, updated_at = now() WHERE id = $1 AND user_id = $2`,
+        [source.id, userId]
+      );
+      // Carries the source's own include/exclude choice forward if the target doesn't
+      // already have it on - same "OR the two together" reasoning sync_recurring's own
+      // supersededManualBill handling already uses when Plaid's detector picks up a bill a
+      // manual one already covered.
+      if (source.user_included && !target.user_included) {
+        await client.query(
+          `UPDATE recurring_bills SET user_included = true, updated_at = now() WHERE id = $1 AND user_id = $2`,
+          [target.id, userId]
+        );
+      }
+      // Moves every transaction linked to the source over to the target, so its history
+      // survives under the surviving bill instead of being stranded on one that's now
+      // permanently inactive - each transaction's own per-row user_excluded override is
+      // left untouched, same as every other bill mutation in this file already does.
+      await client.query(
+        `UPDATE transactions SET recurring_bill_id = $1, is_recurring_bill = true WHERE recurring_bill_id = $2 AND user_id = $3`,
+        [target.id, source.id, userId]
+      );
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to merge these bills.' });
+  }
+});
+
 // Auto-posts a real manual_expenses row for each opted-in recurring bill (auto_post = true,
 // see AddRecurringBillModal's "Auto-add to spend" toggle) whose next cycle has come due -
 // "assign a day... every time that day comes up it will come up in the spend" per the
@@ -2959,7 +3042,106 @@ app.patch('/api/expenses/:id/amount', async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Failed to update expense amount' });
+    res.status(500).json({ error: 'Failed to update amount' });
+  }
+});
+
+// Corrects which calendar day a manual expense counts against - manual only, no equivalent
+// for a synced transaction (see PATCH .../amount's own manual-only siblings for the same
+// "manual can do more" pattern - a synced transaction's date is real bank data, not
+// something to freely move). Previously the only way to log an expense was for the day it
+// happened to be logged on - forgetting to log something and entering it the next morning
+// silently misattributed it to the wrong day, with nothing to fix it after the fact. Same
+// isValidDateKey format check as every other local_date, no upper bound on how far in the
+// future the date can be - matches POST /api/expenses' own precedent (creation has never
+// rejected a future date either), so this isn't a new, stricter rule; the client's own
+// DatePicker range guides toward sane values instead.
+app.patch('/api/expenses/:id/date', async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid expense id' });
+    }
+    const localDate = req.body?.local_date;
+    if (!isValidDateKey(localDate)) {
+      return res.status(400).json({ error: "local_date (YYYY-MM-DD) is required" });
+    }
+    const userId = req.userId;
+    const result = await pool.query('UPDATE manual_expenses SET local_date = $1 WHERE id = $2 AND user_id = $3 RETURNING id', [
+      localDate,
+      req.params.id,
+      userId,
+    ]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Expense not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update expense date' });
+  }
+});
+
+// Splits a single manually-logged expense across 2-10 categories (a Target run that's half
+// groceries, half household) - deletes the original and creates the categorized pieces as
+// new manual expenses on the same day, same amount+note lineage, nothing preserved for
+// reconciliation the way the synced-transaction sibling (POST /api/transactions/:id/split)
+// needs to, since there's no real bank record underneath a manual entry to begin with.
+app.post('/api/expenses/:id/split', async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid expense id' });
+    }
+    const parts = Array.isArray(req.body?.parts) ? req.body.parts : [];
+    if (parts.length < 2 || parts.length > 10) {
+      return res.status(400).json({ error: 'parts must be an array of 2 to 10 entries.' });
+    }
+    const parsedParts = [];
+    for (const p of parts) {
+      const amount = Number(p?.amount);
+      if (!Number.isFinite(amount) || amount <= 0 || amount > MAX_MONEY_AMOUNT) {
+        return res.status(400).json({ error: 'Each part needs an amount greater than $0.' });
+      }
+      const choice = parseCategoryChoice(p);
+      if (!choice) return res.status(400).json({ error: 'Each part needs a valid category.' });
+      parsedParts.push({ amount, ...choice });
+    }
+
+    const userId = req.userId;
+    const existing = await pool.query(
+      "SELECT amount, note, local_date, occurred_at FROM manual_expenses WHERE id = $1 AND user_id = $2",
+      [req.params.id, userId]
+    );
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Expense not found' });
+    const original = existing.rows[0];
+    if (!(Number(original.amount) > 0)) {
+      return res.status(400).json({ error: 'Only a real expense can be split - not income.' });
+    }
+    const partsSum = parsedParts.reduce((sum, p) => sum + p.amount, 0);
+    if (Math.round(partsSum * 100) !== Math.round(Number(original.amount) * 100)) {
+      return res.status(400).json({ error: 'The parts must add up to the original amount.' });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('DELETE FROM manual_expenses WHERE id = $1 AND user_id = $2', [req.params.id, userId]);
+      for (const p of parsedParts) {
+        await client.query(
+          `INSERT INTO manual_expenses (user_id, amount, note, local_date, occurred_at, pfc_primary, category_label, category_color)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [userId, p.amount, original.note, original.local_date, original.occurred_at, p.pfcPrimary, p.customLabel, p.customColor]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to split this expense.' });
   }
 });
 
@@ -3415,6 +3597,87 @@ app.patch('/api/transactions/:id/amount', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to update transaction amount' });
+  }
+});
+
+// Splits a single real bank charge across 2-10 categories (a Target run that's half
+// groceries, half household) - can't delete a synced transaction (it's real bank data),
+// so this excludes the original instead (same tri-state override every other exclusion
+// already uses) and creates the categorized pieces as new manual expenses on the same
+// date. The excluded original stays visible in history, dimmed like any other excluded
+// row - a "receipt" to reconcile against the bank's own statement, not double-counted
+// since it's excluded. user_excluded, not a delete, mirrors PATCH .../amount's own
+// "manual can do more than synced" pattern (see splitExpense below for the manual sibling,
+// which really does delete the original - nothing to preserve for reconciliation there).
+app.post('/api/transactions/:id/split', async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid transaction id' });
+    }
+    const parts = Array.isArray(req.body?.parts) ? req.body.parts : [];
+    if (parts.length < 2 || parts.length > 10) {
+      return res.status(400).json({ error: 'parts must be an array of 2 to 10 entries.' });
+    }
+    const parsedParts = [];
+    for (const p of parts) {
+      const amount = Number(p?.amount);
+      if (!Number.isFinite(amount) || amount <= 0 || amount > MAX_MONEY_AMOUNT) {
+        return res.status(400).json({ error: 'Each part needs an amount greater than $0.' });
+      }
+      const choice = parseCategoryChoice(p);
+      if (!choice) return res.status(400).json({ error: 'Each part needs a valid category.' });
+      parsedParts.push({ amount, ...choice });
+    }
+
+    const userId = req.userId;
+    const existing = await pool.query(
+      `SELECT amount, user_amount, name, merchant_name, user_label, to_char(date, 'YYYY-MM-DD') AS date
+       FROM transactions WHERE id = $1 AND user_id = $2`,
+      [req.params.id, userId]
+    );
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Transaction not found' });
+    const original = existing.rows[0];
+    // COALESCE order matching every spend-total query in this file - user_amount, when
+    // set, is the real corrected figure to split, not Plaid's original.
+    const originalAmount = Number(original.user_amount ?? original.amount);
+    if (!(originalAmount > 0)) {
+      return res.status(400).json({ error: 'Only a real charge can be split.' });
+    }
+    const partsSum = parsedParts.reduce((sum, p) => sum + p.amount, 0);
+    // Rounded to the cent before comparing - summing several decimal amounts in floating
+    // point can land a fraction of a cent off the original total even when a person's own
+    // math is exactly right (e.g. splitting $100 three ways as 33.33/33.33/33.34).
+    if (Math.round(partsSum * 100) !== Math.round(originalAmount * 100)) {
+      return res.status(400).json({ error: 'The parts must add up to the original amount.' });
+    }
+    const note = original.user_label || original.merchant_name || original.name;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('UPDATE transactions SET user_excluded = true WHERE id = $1 AND user_id = $2', [
+        req.params.id,
+        userId,
+      ]);
+      for (const p of parsedParts) {
+        await client.query(
+          `INSERT INTO manual_expenses (user_id, amount, note, local_date, pfc_primary, category_label, category_color)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [userId, p.amount, note, original.date, p.pfcPrimary, p.customLabel, p.customColor]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to split this transaction.' });
   }
 });
 

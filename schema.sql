@@ -524,3 +524,13 @@ ALTER TABLE recurring_bills ADD COLUMN IF NOT EXISTS last_posted_date DATE;
 -- categorizable, same as the user's own), kept purely as a lineage/audit trail for a
 -- feature that creates real financial records with no direct per-occurrence user action.
 ALTER TABLE manual_expenses ADD COLUMN IF NOT EXISTS recurring_bill_id INTEGER REFERENCES recurring_bills(id);
+
+-- Set by POST /api/bills/:id/merge when a bill is combined into another (a merchant's
+-- billing descriptor changed and Plaid's own detector treats it as a brand-new stream with
+-- no continuity from the old one, most commonly) - is_active = false alone isn't enough
+-- for a Plaid-origin bill, since the very next /api/sync_recurring call would just upsert
+-- it right back to is_active = true if Plaid is still actively returning that stream_id
+-- (its own ON CONFLICT clause blindly trusted EXCLUDED.is_active before this existed). This
+-- makes a merge permanent regardless of what Plaid keeps reporting, until the user
+-- explicitly does something about it again - nothing currently un-sets it.
+ALTER TABLE recurring_bills ADD COLUMN IF NOT EXISTS merged_away BOOLEAN NOT NULL DEFAULT false;
