@@ -2040,7 +2040,10 @@ app.get('/api/bills', async (req, res) => {
       // see acknowledgeBillPriceIncrease, which clears it back to NULL), this shows the
       // known-current last_amount instead; once acknowledged, it reverts to trusting
       // Plaid's own average again, which by then should have caught up.
-      `SELECT rb.id, rb.merchant_name, rb.description, rb.average_amount, rb.last_amount, rb.frequency, to_char(rb.last_date, 'YYYY-MM-DD') AS last_date, rb.is_active, rb.user_included, rb.pfc_primary, rb.previous_amount,
+      // is_manual, auto_post, and whether plaid_item_id is null - the frontend uses these
+      // to decide whether to offer editing/deleting at all (see PATCH/DELETE
+      // /api/bills/:id's own comments on why that's scoped narrower than "any bill").
+      `SELECT rb.id, rb.merchant_name, rb.description, rb.average_amount, rb.last_amount, rb.frequency, to_char(rb.last_date, 'YYYY-MM-DD') AS last_date, rb.is_active, rb.user_included, rb.pfc_primary, rb.previous_amount, rb.is_manual, rb.auto_post, (rb.plaid_item_id IS NULL) AS is_from_scratch,
               CASE WHEN rb.previous_amount IS NOT NULL THEN rb.last_amount ELSE rb.average_amount END AS display_amount
        FROM recurring_bills rb
        LEFT JOIN plaid_items pi ON pi.id = rb.plaid_item_id
@@ -2241,6 +2244,168 @@ app.post('/api/bills/create_manual', requirePaidTier, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to create this recurring bill.' });
+  }
+});
+
+// Edits a bill created from scratch (POST /api/bills/create_manual) - scoped to
+// plaid_item_id IS NULL, not every is_manual bill, since a mark_recurring-origin bill's
+// amount/last_date are kept current from a REAL linked transaction (see sync_recurring's
+// own manual-bill matching) - hand-editing those would just get overwritten by the next
+// sync that finds a matching charge. Same field set and validation as create_manual,
+// since this is really "the same form, pre-filled" from the frontend's own perspective.
+app.patch('/api/bills/:id', requirePaidTier, async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid bill id' });
+    }
+    const userId = req.userId;
+    const { label, amount: rawAmount, frequency, lastDate, pfcPrimary, included, autoPost } = req.body || {};
+
+    const trimmedLabel = typeof label === 'string' ? label.trim() : '';
+    if (!trimmedLabel || trimmedLabel.length > 60) {
+      return res.status(400).json({ error: 'label is required, 60 characters or fewer.' });
+    }
+    const amount = Number(rawAmount);
+    if (!Number.isFinite(amount) || amount <= 0 || amount > MAX_MONEY_AMOUNT) {
+      return res.status(400).json({ error: `amount must be a positive number, up to ${MAX_MONEY_AMOUNT}` });
+    }
+    if (!MANUAL_BILL_FREQUENCIES.includes(frequency)) {
+      return res.status(400).json({ error: `frequency must be one of ${MANUAL_BILL_FREQUENCIES.join(', ')}.` });
+    }
+    if (!isValidDateKey(lastDate)) {
+      return res.status(400).json({ error: 'lastDate (YYYY-MM-DD) is required - the most recent time this was due.' });
+    }
+    if (!CATEGORY_KEYS.includes(pfcPrimary)) {
+      return res.status(400).json({ error: 'A valid category is required.' });
+    }
+    if (autoPost && !included) {
+      return res.status(400).json({ error: 'autoPost requires included to also be true.' });
+    }
+    const merchantKey = trimmedLabel.toLowerCase();
+    if (!merchantKey) {
+      return res.status(400).json({ error: 'label must contain more than just whitespace.' });
+    }
+
+    const existing = await pool.query(
+      `SELECT id, merchant_key, to_char(last_date, 'YYYY-MM-DD') AS last_date, frequency
+       FROM recurring_bills
+       WHERE id = $1 AND user_id = $2 AND is_manual = true AND plaid_item_id IS NULL AND is_active = true`,
+      [req.params.id, userId]
+    );
+    if (existing.rows.length === 0) {
+      return res.status(404).json({ error: 'Bill not found, or not editable.' });
+    }
+
+    // Renaming can collide with a different active manual bill's own merchant_key - same
+    // duplicate-prevention check create_manual already does, excluding this bill's own
+    // current row so re-saving under the same name it already has doesn't false-positive
+    // against itself.
+    if (merchantKey !== existing.rows[0].merchant_key) {
+      const dup = await pool.query(
+        `SELECT id FROM recurring_bills WHERE user_id = $1 AND is_manual = true AND is_active = true AND merchant_key = $2 AND id != $3`,
+        [userId, merchantKey, req.params.id]
+      );
+      if (dup.rows.length > 0) {
+        return res.status(409).json({ error: 'You already have an active recurring bill with this name.' });
+      }
+    }
+
+    // last_posted_date (the auto-post catch-up cursor) only resets when the cycle anchor
+    // itself changed (last_date or frequency) - resetting it unconditionally on every edit
+    // would make POST /api/bills/run_auto_post think nothing had ever been posted for a
+    // bill that's already several cycles in, re-walking forward from the ORIGINAL last_date
+    // and re-posting every one of those as a duplicate manual_expenses row. A cosmetic edit
+    // (amount, category, name) leaves the cadence untouched, so the cursor stays valid.
+    const cycleChanged = existing.rows[0].last_date !== lastDate || existing.rows[0].frequency !== frequency;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE recurring_bills
+         SET merchant_name = $1, description = $1, average_amount = $2, last_amount = $2,
+             frequency = $3, last_date = $4, pfc_primary = $5, merchant_key = $6,
+             user_included = $7, auto_post = $8, previous_amount = NULL,
+             last_posted_date = CASE WHEN $9 THEN NULL ELSE last_posted_date END,
+             updated_at = now()
+         WHERE id = $10 AND user_id = $11`,
+        [trimmedLabel, amount, frequency, lastDate, pfcPrimary, merchantKey, !!included, !!autoPost, cycleChanged, req.params.id, userId]
+      );
+      // Same cascade PATCH .../include already applies - this bill may have picked up a
+      // real linked transaction via sync_recurring's merchant_key matching (the case that
+      // also turns auto_post back off - see that query's own comment), and un-including
+      // here should affect it the same way toggling the dedicated include switch would.
+      await client.query(
+        `UPDATE transactions SET user_excluded = $1 WHERE recurring_bill_id = $2 AND user_id = $3`,
+        [included ? false : null, req.params.id, userId]
+      );
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to update this bill.' });
+  }
+});
+
+// Removes a recurring bill the user flagged or created themselves (is_manual = true -
+// either from a real transaction via mark_recurring, or entirely from scratch via
+// create_manual). Not offered for a Plaid-auto-detected bill, which the next sync would
+// just recreate anyway (see sync_recurring's own upsert) - the exclude toggle is the real
+// equivalent for those. Soft-delete (is_active = false), not a hard DELETE row - same
+// convention this table already uses everywhere else a bill goes away (ghost-bill
+// cleanup, a manual bill superseded by Plaid's own detection), and preserves any
+// manual_expenses.recurring_bill_id lineage auto-post already created rather than
+// breaking it.
+app.delete('/api/bills/:id', requirePaidTier, async (req, res) => {
+  try {
+    if (!isValidId(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid bill id' });
+    }
+    const userId = req.userId;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query(
+        `UPDATE recurring_bills SET is_active = false, updated_at = now()
+         WHERE id = $1 AND user_id = $2 AND is_manual = true
+         RETURNING id`,
+        [req.params.id, userId]
+      );
+      if (result.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Bill not found, or not deletable.' });
+      }
+      // Same cleanup sync_recurring's own ghost-bill handling already does when a bill
+      // drops out from under its linked transactions - without this, any transaction
+      // still pointing at this now-deleted bill would stay permanently excluded from
+      // spend (is_recurring_bill = true) with nothing left in Bills to toggle it back on.
+      // user_excluded is deliberately left alone, same reasoning as that cleanup query's
+      // own comment - a per-transaction override survives its bill going away.
+      await client.query(
+        `UPDATE transactions SET is_recurring_bill = false, recurring_bill_id = NULL
+         WHERE recurring_bill_id = $1 AND user_id = $2`,
+        [req.params.id, userId]
+      );
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to delete this bill.' });
   }
 });
 
