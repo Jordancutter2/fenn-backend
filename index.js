@@ -126,6 +126,16 @@ function parseIdArray(value) {
   return ids;
 }
 
+// For a route taking more than one id array where each is optional (bulk_category's
+// transactionIds/expenseIds): a missing or empty array just means "none of this kind", not
+// an error - parseIdArray alone rejects an empty array, and the app always sends both arrays
+// (one of them empty unless the selection mixes synced and manual rows), so every
+// single-kind bulk recategorize was failing with a 400.
+function parseOptionalIdArray(value) {
+  if (value == null || (Array.isArray(value) && value.length === 0)) return [];
+  return parseIdArray(value);
+}
+
 const app = express();
 // Required for express-rate-limit (and req.ip generally) to see the real client IP rather
 // than one of Railway's own internal proxy hops - without this every request looks like
@@ -3521,8 +3531,8 @@ app.patch('/api/transactions/:id/category', async (req, res) => {
 // transaction's own recategorize.
 app.patch('/api/bulk_category', async (req, res) => {
   try {
-    const transactionIds = req.body?.transactionIds != null ? parseIdArray(req.body.transactionIds) : [];
-    const expenseIds = req.body?.expenseIds != null ? parseIdArray(req.body.expenseIds) : [];
+    const transactionIds = parseOptionalIdArray(req.body?.transactionIds);
+    const expenseIds = parseOptionalIdArray(req.body?.expenseIds);
     if (transactionIds === null || expenseIds === null) {
       return res.status(400).json({ error: `ids must be arrays of up to ${BULK_MAX_IDS} ids` });
     }
